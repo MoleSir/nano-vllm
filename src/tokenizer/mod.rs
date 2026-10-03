@@ -17,7 +17,8 @@ pub struct Tokenizer {
     unk_token_id: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TokenizerConfig {
     pub add_bos_token: bool,
     pub add_eos_token: bool,
@@ -27,10 +28,10 @@ pub struct TokenizerConfig {
 
     pub additional_special_tokens: Vec<String>,
 
-    pub bos_token: String,
-    pub eos_token: String,
-    pub pad_token: String,
-    pub unk_token: String,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
+    pub pad_token: Option<String>,
+    pub unk_token: Option<String>,
 
     pub clean_up_tokenization_spaces: bool,
     pub legacy: bool,
@@ -70,10 +71,18 @@ impl Tokenizer {
         let config_content = std::fs::read_to_string(config_path)?;
         let config: TokenizerConfig = serde_json::from_str(&config_content)?;
 
-        let bos_token_id = tokenizer.token_to_id(&config.bos_token).ok_or_else(|| anyhow::anyhow!("no bos token!"))?;
-        let eos_token_id = tokenizer.token_to_id(&config.eos_token).ok_or_else(|| anyhow::anyhow!("no eps token!"))?;
-        let pad_token_id = tokenizer.token_to_id(&config.pad_token).ok_or_else(|| anyhow::anyhow!("no pad token!"))?;
-        let unk_token_id = tokenizer.token_to_id(&config.unk_token).ok_or_else(|| anyhow::anyhow!("no unk token!"))?;
+        let eos_token_id = config
+            .eos_token
+            .as_deref()
+            .and_then(|token| tokenizer.token_to_id(token))
+            .ok_or_else(|| anyhow::anyhow!("no eos token!"))?;
+
+        // Some Qwen tokenizers leave bos/pad/unk unset (null in the JSON).
+        // Fall back gracefully so generation can still run.
+        let lookup = |token: Option<&str>| token.and_then(|token| tokenizer.token_to_id(token));
+        let bos_token_id = lookup(config.bos_token.as_deref()).or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(eos_token_id);
+        let pad_token_id = lookup(config.pad_token.as_deref()).unwrap_or(eos_token_id);
+        let unk_token_id = lookup(config.unk_token.as_deref()).unwrap_or(eos_token_id);
 
         Ok(Self { tokenizer: Mutex::new(tokenizer), config, bos_token_id, eos_token_id, pad_token_id, unk_token_id })
     }
@@ -95,19 +104,19 @@ impl Tokenizer {
     }
 
     pub fn eos_token(&self) -> &str {
-        &self.config.eos_token
+        self.config.eos_token.as_deref().unwrap_or("")
     }
 
     pub fn bos_token(&self) -> &str {
-        &self.config.bos_token
+        self.config.bos_token.as_deref().unwrap_or("")
     }
 
     pub fn pad_token(&self) -> &str {
-        &self.config.pad_token
+        self.config.pad_token.as_deref().unwrap_or("")
     }
 
     pub fn unk_token(&self) -> &str {
-        &self.config.unk_token
+        self.config.unk_token.as_deref().unwrap_or("")
     }
 }
 

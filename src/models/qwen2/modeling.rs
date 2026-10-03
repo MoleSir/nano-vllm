@@ -11,13 +11,23 @@ use luma::{
 #[derive(Module)]
 pub struct Qwen2ForCausalLM<Dev: Device> {
     pub model: Qwen2Model<Dev>,
+    /// Only present when the LM head is *not* tied to the token embeddings.
+    /// `#[derive(Module)]` skips a `None` field entirely, so tied checkpoints
+    /// (which have no `lm_head.weight`) load cleanly with `strict = false`.
+    pub lm_head: Option<Linear<Dev>>,
     #[module(skip)]
     pub config: Qwen2Config,
 }
 
 impl<Dev: Device> Qwen2ForCausalLM<Dev> {
     pub fn new(config: &Qwen2Config, dtype: FloatDType, device: &Dev) -> anyhow::Result<Self> {
-        Ok(Self { model: Qwen2Model::new(config, dtype, device).context("init Qwen2 model")?, config: config.clone() })
+        let model = Qwen2Model::new(config, dtype, device).context("init Qwen2 model")?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(gpt2_linear(config.hidden_size, config.vocab_size, dtype, device).context("init lm_head")?)
+        };
+        Ok(Self { model, lm_head, config: config.clone() })
     }
 
     pub fn forward(
@@ -29,9 +39,14 @@ impl<Dev: Device> Qwen2ForCausalLM<Dev> {
         // (batch_size, seq_len) => (batch_size, seq_len, hidden_size)
         let hidden_states = self.model.forward(input_ids, start_pos, cache).context("model forward")?;
 
-        let wte_weight = &self.model.embed_tokens.weight;
         // (batch_size, seq_len, hidden_size) => (batch_size, seq_len, vocab_size)
-        let logits = luma::nn::functional::linear(&hidden_states, &wte_weight, None).context("lm head forward")?;
+        let logits = match &self.lm_head {
+            Some(lm_head) => lm_head.forward(&hidden_states).context("lm head forward")?,
+            None => {
+                let wte_weight = &self.model.embed_tokens.weight;
+                luma::nn::functional::linear(&hidden_states, wte_weight, None).context("tied lm head forward")?
+            }
+        };
 
         Ok(logits)
     }
@@ -164,9 +179,6 @@ pub struct Qwen2Attention<Dev: Device> {
     pub v_proj: Linear<Dev>,
     pub o_proj: Linear<Dev>,
 
-    pub q_norm: RMSNorm<Dev>,
-    pub k_norm: RMSNorm<Dev>,
-
     #[module(skip)]
     pub layer_index: usize,
 
@@ -191,20 +203,18 @@ impl<Dev: Device> Qwen2Attention<Dev> {
         let num_key_value_heads = config.num_key_value_heads;
         let hidden_size = config.hidden_size;
 
-        let q_proj = gpt2_linear(hidden_size, head_size * num_attention_heads, dtype, device).context("init attention q_proj")?;
-        let k_proj = gpt2_linear(hidden_size, head_size * num_key_value_heads, dtype, device).context("init attention k_proj")?;
-        let v_proj = gpt2_linear(hidden_size, head_size * num_key_value_heads, dtype, device).context("init attention v_proj")?;
+        // Qwen2 applies a bias to q/k/v (unlike o_proj and the MLP projections).
+        let attention_bias = config.attention_bias;
+        let q_proj = gpt2_linear_bias(hidden_size, head_size * num_attention_heads, attention_bias, dtype, device).context("init attention q_proj")?;
+        let k_proj = gpt2_linear_bias(hidden_size, head_size * num_key_value_heads, attention_bias, dtype, device).context("init attention k_proj")?;
+        let v_proj = gpt2_linear_bias(hidden_size, head_size * num_key_value_heads, attention_bias, dtype, device).context("init attention v_proj")?;
         let o_proj = gpt2_linear(head_size * num_attention_heads, hidden_size, dtype, device).context("init attention o_proj")?;
-        let q_norm = rms_norm(head_size, config.rms_norm_eps, device, dtype).context("init q_norm")?;
-        let k_norm = rms_norm(head_size, config.rms_norm_eps, device, dtype).context("init k_norm")?;
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-            q_norm,
-            k_norm,
             layer_index,
             head_size,
             num_attention_heads,
@@ -230,8 +240,6 @@ impl<Dev: Device> Qwen2Attention<Dev> {
         let v = self.split_heads(v, self.num_key_value_heads).context("split v heads")?; // (batch, num_key_value_heads, seq, head_size)
 
         // 2. Rope
-        let q = self.q_norm.forward(&q).context("q_norm forward")?;
-        let k = self.k_norm.forward(&k).context("q_norm forward")?;
         let q = rope.apply_rotary_emb(&q, start_pos).context("apply rope to q")?; // (batch, num_attention_heads, seq, head_size)
         let k = rope.apply_rotary_emb(&k, start_pos).context("apply rope to k")?; // (batch, num_key_value_heads, seq, head_size)
 
@@ -406,6 +414,18 @@ fn rms_norm<Dev: Device>(normalized_shape: usize, eps: f64, device: &Dev, dtype:
 /// Kaiming default here makes the initial activations and gradients too large
 /// and the loss diverges to NaN within a handful of steps.
 fn gpt2_linear<Dev: Device>(in_features: usize, out_features: usize, dtype: FloatDType, device: &Dev) -> anyhow::Result<Linear<Dev>> {
-    let config = LinearConfig { in_features, out_features, bias: false, weight_init: Init::normal(0.0, 0.02), bias_init: Init::zeros() };
+    gpt2_linear_bias(in_features, out_features, false, dtype, device)
+}
+
+/// GPT-2 / Qwen2 style linear layer, optionally with a zero-initialised bias
+/// (Qwen2 attention q/k/v projections carry a bias; o_proj and the MLP do not).
+fn gpt2_linear_bias<Dev: Device>(
+    in_features: usize,
+    out_features: usize,
+    bias: bool,
+    dtype: FloatDType,
+    device: &Dev,
+) -> anyhow::Result<Linear<Dev>> {
+    let config = LinearConfig { in_features, out_features, bias, weight_init: Init::normal(0.0, 0.02), bias_init: Init::zeros() };
     Ok(Linear::from_config(&config, (device, dtype)).context("init gpt2 linear")?)
 }

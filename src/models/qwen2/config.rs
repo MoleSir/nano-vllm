@@ -13,6 +13,7 @@ pub struct RopeScaling {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[builder(pattern = "owned", build_fn(validate = "Self::validate"))]
+#[serde(default)]
 pub struct Qwen2Config {
     #[builder(default = "1")]
     pub bos_token_id: i64,
@@ -59,6 +60,12 @@ pub struct Qwen2Config {
     #[builder(default = "true")]
     pub flash_attn: bool,
 
+    #[builder(default = "true")]
+    pub attention_bias: bool,
+
+    #[builder(default = "true")]
+    pub tie_word_embeddings: bool,
+
     // ===== MoE =====
     #[builder(default = "false")]
     pub use_moe: bool,
@@ -85,7 +92,19 @@ pub struct Qwen2Config {
     pub norm_topk_prob: bool,
 }
 
+impl Default for Qwen2Config {
+    fn default() -> Self {
+        Qwen2ConfigBuilder::default().build().expect("Qwen2Config defaults are valid")
+    }
+}
+
 impl Qwen2Config {
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path.as_ref())?;
+        let config: Self = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
     pub fn small() -> Self {
         Qwen2ConfigBuilder::default()
             .vocab_size(6400)
