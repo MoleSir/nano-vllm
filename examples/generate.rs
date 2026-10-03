@@ -30,7 +30,7 @@ fn run<Dev: Device>(device: &Dev) -> anyhow::Result<()> {
     println!("model loaded: {} layers, hidden {}", model.config.num_hidden_layers, model.config.hidden_size);
 
     let messages = vec![Message::user("你好，请用一句话介绍一下你自己。")];
-    let prompt = tokenizer.apply_chat_template(&messages, true);
+    let prompt = tokenizer.apply_chat_template(&messages, true).context("apply chat template")?;
     let encoding = tokenizer
         .encode(&prompt, EncodeOptions { add_special_tokens: false, ..Default::default() })
         .context("encode prompt")?;

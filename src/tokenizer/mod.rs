@@ -142,7 +142,7 @@ mod tests {
             Message::user("Can you write a Rust struct for me?"),
         ];
 
-        let prompt_string = tokenizer.apply_chat_template(&messages, false);
+        let prompt_string = tokenizer.apply_chat_template(&messages, false).unwrap();
 
         println!("{}", prompt_string);
     }
