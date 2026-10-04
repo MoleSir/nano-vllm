@@ -2,7 +2,7 @@ use anyhow::Context;
 use luma::dtype::IntDType;
 use luma::tensor::IntTensor;
 use luma::{Device, Tensor, no_grad};
-use nanovllm::models::Sampler;
+use nanovllm::models::SamplingParams;
 use nanovllm::models::qwen2::{Qwen2Config, Qwen2ForCausalLM, Qwen2KvCache};
 use nanovllm::tokenizer::{EncodeOptions, Message, Tokenizer};
 
@@ -37,8 +37,8 @@ fn run<Dev: Device>(device: &Dev) -> anyhow::Result<()> {
     let prompt_ids = encoding.get_ids().to_vec();
     println!("prompt tokens: {}", prompt_ids.len());
 
-    let sampler = Sampler::strict();
-    let generated = generate(&model, &model.config, device, &prompt_ids, MAX_NEW_TOKENS, tokenizer.eos_token_id(), &sampler)?;
+    let params = SamplingParams::greedy();
+    let generated = generate(&model, &model.config, device, &prompt_ids, MAX_NEW_TOKENS, tokenizer.eos_token_id(), params)?;
 
     let text = tokenizer.decode(&generated, true).context("decode output")?;
     println!("\n=== generated ===\n{text}");
@@ -53,14 +53,14 @@ fn generate<Dev: Device>(
     prompt_ids: &[u32],
     max_new_tokens: usize,
     eos_token_id: u32,
-    sampler: &Sampler,
+    params: SamplingParams,
 ) -> anyhow::Result<Vec<u32>> {
     let mut cache = Some(Qwen2KvCache::new(config));
 
     let prompt: Vec<i64> = prompt_ids.iter().map(|&id| id as i64).collect();
     let input = IntTensor::<Dev>::from_slice(&prompt, (1, prompt.len()), (device, IntDType::U32)).context("build prompt input")?;
     let logits = model.forward(&input, 0, &mut cache).context("prefill")?;
-    let mut next = sample_last(sampler, &logits)?;
+    let mut next = sample_last(params, &logits)?;
 
     let mut generated = Vec::with_capacity(max_new_tokens);
     let mut start_pos = prompt_ids.len();
@@ -72,16 +72,16 @@ fn generate<Dev: Device>(
 
         let input = IntTensor::<Dev>::from_slice(&[next as i64], (1, 1), (device, IntDType::U32)).context("build decode input")?;
         let logits = model.forward(&input, start_pos, &mut cache).context("decode step")?;
-        next = sample_last(sampler, &logits)?;
+        next = sample_last(params, &logits)?;
         start_pos += 1;
     }
 
     Ok(generated)
 }
 
-fn sample_last<Dev: Device>(sampler: &Sampler, logits: &Tensor<Dev>) -> anyhow::Result<u32> {
+fn sample_last<Dev: Device>(params: SamplingParams, logits: &Tensor<Dev>) -> anyhow::Result<u32> {
     let (_, seq, _) = logits.dims3().context("logits dims3")?;
     let last = logits.narrow(1, seq - 1, 1).context("narrow last logits")?.contiguous().context("contiguous logits")?;
-    let tokens = sampler.sample(&last, &[sampler.temperature()]).context("sample last")?;
-    Ok(tokens[0])
+    let flat = last.to_vec().context("logits to vec")?;
+    Ok(params.sample(&flat))
 }

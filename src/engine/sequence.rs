@@ -1,12 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::BLOCK_SIZE;
-
-pub struct SamplingParams {
-    pub temperature: f64,
-    pub max_new_tokens: usize,
-    pub ignore_eos: bool,
-}
+use crate::models::SamplingParams;
 
 /// 一条序列在其生命周期中的阶段（决定它下一步需要 prefill 还是 decode）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,21 +96,5 @@ impl Sequence {
 
     pub fn push_token(&mut self, token_id: u32) {
         self.token_ids.push(token_id);
-    }
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: 1.0,
-            max_new_tokens: 64,
-            ignore_eos: false,
-        }
-    }
-}
-
-impl SamplingParams {
-    pub fn new() -> Self {
-        Self::default()
     }
 }

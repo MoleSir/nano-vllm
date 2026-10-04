@@ -59,7 +59,7 @@ slot = block_table[lb] * block_size + off
 
 - dtype：`f32`（luma 目前只有 F32/F64）。
 - `head_dim ∈ {32, 64, 128}`（建议），`num_heads % num_kv_heads == 0`（GQA）。
-- `block_size` 必须是 **256 的倍数**（nanovllm 固定 256）。
+- `block_size` 在 nanovllm 中由 `engine::BLOCK_SIZE` 固定为 **256**（全引擎唯一来源，编译期常量）。
 - `scale` 显式传入，通常 `1 / sqrt(head_dim)`。
 - 索引统一 `i32`。
 

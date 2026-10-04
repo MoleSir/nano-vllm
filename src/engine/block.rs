@@ -333,7 +333,7 @@ pub fn compute_hash(token_ids: &[u32], prefix: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::SamplingParams;
+    use crate::models::SamplingParams;
     use crate::error::Error;
 
     fn tokens(range: std::ops::Range<u32>) -> Vec<u32> {

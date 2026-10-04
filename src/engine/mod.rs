@@ -8,8 +8,17 @@ pub use scheduler::*;
 pub use sequence::*;
 
 use luma::Cuda;
-use crate::{config::Config, tokenizer::{EncodeOptions, Tokenizer}};
+use crate::{
+    config::Config,
+    models::SamplingParams,
+    tokenizer::{EncodeOptions, Tokenizer},
+};
 
+/// 每个 KV cache 物理块容纳的 token 数。
+///
+/// 这是**全引擎唯一的块大小来源**（编译期常量）：`Sequence` 的块划分、
+/// `BlockManager` 的分配、`ModelRunner` 的 slot 计算以及 paged kernel 都基于它。
+/// 不再通过 `Config` 配置；要修改请直接改这里并重新编译。
 pub const BLOCK_SIZE: usize = 256;
 
 /// 本步批次的阶段：prefill（变长打包）或 decode（每序列一个 token）。
@@ -28,8 +37,6 @@ pub struct LLMEngine {
 
 impl LLMEngine {
     pub fn new(mut config: Config) -> anyhow::Result<Self> {
-        anyhow::ensure!(config.kvcache_block_size % 256 == 0, "kvcache_block_size 必须是 256 的倍数");
-
         let tokenizer = Tokenizer::from_file(&config.model)?;
         config.eos_token_id = tokenizer.eos_token_id();
 

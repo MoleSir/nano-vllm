@@ -3,11 +3,13 @@ use std::path::Path;
 use luma::{Cuda, FloatDType, IndexOp, Int, Tensor, tensor::IntTensor};
 
 use crate::{
-    models::{components::Attention, Context},
     config::Config,
     engine::{BLOCK_SIZE, Phase, Sequence},
-    models::Sampler,
-    models::qwen2::{Qwen2Config, Qwen2ForCausalLM},
+    models::{
+        components::Attention,
+        qwen2::{Qwen2Config, Qwen2ForCausalLM},
+        Context,
+    },
 };
 
 pub struct ModelRunner {
@@ -16,7 +18,6 @@ pub struct ModelRunner {
     pub model: Qwen2ForCausalLM<Cuda>,
     pub kv_cache: Tensor<Cuda>,
     pub attn: Vec<Attention>,
-    pub sampler: Sampler,
     pub dev: Cuda,
 }
 
@@ -33,7 +34,6 @@ impl ModelRunner {
             model,
             kv_cache,
             attn: Vec::new(),
-            sampler: Sampler::strict(),
             dev,
         };
         runner.allocate_kv_cache()?;
@@ -51,9 +51,16 @@ impl ModelRunner {
         // input_ids/positions: (num_tokens,) -> (num_seq, vocab_size)
         // 此时 kvcache 中已经被插入了新计算出来的 token，但 seq.len() 还不变
         let logits = self.model.forward_paged(&input_ids, &positions, &context, &self.attn)?;
-        let temperatures = self.temperatures(seqs);
-        // (num_seq, vocab_size) -> (num_seq,)
-        self.sampler.sample(&logits, &temperatures)
+
+        // (num_seq, vocab_size)：逐个 seq 用各自的采样参数采一个 token
+        let vocab = *logits.dims().last().expect("logits must be non-empty");
+        let flat = logits.to_vec()?;
+        debug_assert_eq!(flat.len(), seqs.len() * vocab);
+        let mut tokens = Vec::with_capacity(seqs.len());
+        for (row, seq) in seqs.iter().enumerate() {
+            tokens.push(seq.sampling_params.sample(&flat[row * vocab..(row + 1) * vocab]));
+        }
+        Ok(tokens)
     }
 
     /// 为一系列需要 prefill 的 seq 准备输入
@@ -185,11 +192,6 @@ impl ModelRunner {
         };
 
         Ok((input_ids, positions, context))
-    }
-
-    /// 收集所有 seqs 的 sampling_params.temperature
-    pub fn temperatures(&self, seqs: &[Sequence]) -> Vec<f64> {
-        seqs.iter().map(|seq| seq.sampling_params.temperature).collect()
     }
 
     /// Allocate the single paged KV cache tensor and build the per-layer

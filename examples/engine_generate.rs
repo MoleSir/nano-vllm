@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use anyhow::Context;
 use nanovllm::config::Config;
-use nanovllm::engine::{LLMEngine, SamplingParams};
+use nanovllm::engine::LLMEngine;
+use nanovllm::models::SamplingParams;
 use nanovllm::tokenizer::{EncodeOptions, Message, Tokenizer};
 
 const MODEL_DIR: &str = "./cache/Qwen2.5-0.5B-Instruct";
@@ -76,7 +77,7 @@ fn add(engine: &mut LLMEngine, tokenizer: &Tokenizer, user: &str, max_tokens: us
         .context("encode")?;
     engine.add_token_request(
         enc.get_ids().to_vec(),
-        SamplingParams { temperature: 0.0, max_new_tokens: max_tokens, ignore_eos: false },
+        SamplingParams { max_new_tokens: max_tokens, ..SamplingParams::greedy() },
     );
     Ok(())
 }

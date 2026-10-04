@@ -26,9 +26,6 @@ pub struct Config {
     #[builder(default = 0)]
     pub eos_token_id: u32,
 
-    #[builder(default = 256)]
-    pub kvcache_block_size: usize,
-
     #[builder(default = 0)]
     pub num_kvcache_blocks: usize,
 }
