@@ -6,11 +6,12 @@ pub use block::*;
 pub use runner::*;
 pub use scheduler::*;
 pub use sequence::*;
+pub use sequence::SamplingParams;
 
 use luma::Cuda;
 use crate::{
     config::Config,
-    engine::{ModelRunner, SamplingParams, Scheduler, Sequence, SequenceStatus},
+    engine::{ModelRunner, Scheduler, Sequence, SequenceStatus},
     tokenizer::{EncodeOptions, Tokenizer},
 };
 
@@ -32,6 +33,9 @@ impl LLMEngine {
 
         let dev = Cuda::new(0)?;
         let model_runner = ModelRunner::new(config.clone(), dev)?;
+        // `allocate_kv_cache` fills in the number of blocks on the runner's
+        // config; propagate it so the scheduler's block manager is sized correctly.
+        config.num_kvcache_blocks = model_runner.config.num_kvcache_blocks;
         let scheduler = Scheduler::new(&config);
 
         Ok(Self { config, tokenizer, model_runner, scheduler })

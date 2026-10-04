@@ -89,34 +89,131 @@ __global__ void flash_attn_varlen_kernel(
     int k_paged,
     float scale
 ) {
-    // TODO(user): implement.
-    //
-    // Suggested grid = (num_seqs, q_heads, ceil(max_seqlen_q / Br)),
-    //          block = (Br), dynamic smem = 2 * Bc * H * sizeof(float).
-    //
-    // Per block:
-    //   s = blockIdx.x; q_head = blockIdx.y; tile = blockIdx.z; row = tile*Br + tid;
-    //   q_start = cu_seqlens_q[s]; q_len = cu_seqlens_q[s+1] - q_start;
-    //   k_start = cu_seqlens_k[s]; k_len = cu_seqlens_k[s+1] - k_start;
-    //   start_pos = k_len - q_len;                 // right-aligned causal
-    //   q_global  = start_pos + row;
-    //   kv_head   = q_head / (q_heads / kv_heads);
-    //
-    // Loop KV tiles (j = jt*Bc ..):
-    //   if (jt * Bc > start_pos + tile*Br + (Br-1)) break;
-    //   load K/V tile; for row_g = jt*Bc + r < k_len:
-    //       if (k_paged) idx = block_slot(block_tables, s, max_blocks, row_g, block_size)
-    //                    else idx = k_start + row_g            (contiguous)
-    //       k = k_pool_or_contig + idx * kv_heads*H + kv_head*H
-    //   score = dot(q_row, k_row) * scale  if (row_g < k_len && q_global >= row_g) else -inf
-    //   online softmax (see README section 2).
-    //
-    // Write o at ((q_start + row) * q_heads + q_head) * H.
-    (void)q; (void)k; (void)v; (void)o;
-    (void)cu_seqlens_q; (void)cu_seqlens_k; (void)block_tables;
+    constexpr int Bc = paged::kBlockN;
+    constexpr int Br = paged::kBlockM;
+
+    const int tid = threadIdx.x;
+    const int s = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int q_tile = blockIdx.z;
+
+    const int q_start = cu_seqlens_q[s];
+    const int q_len = cu_seqlens_q[s + 1] - q_start;
+    const int kv_start = cu_seqlens_k[s];
+    const int k_len = cu_seqlens_k[s + 1] - kv_start;
+    const int start_pos = k_len - q_len;  // right-aligned causal
+
+    const int row = q_tile * Br + tid;
+    const int q_global = start_pos + row;
+
+    const int group_size = q_heads / kv_heads;
+    const int kv_head = q_head / group_size;
+    const int D = kv_heads * H;
+
+    const bool row_valid = (row < q_len);
+    const long q_off = (long)(q_start + row) * q_heads * H + (long)q_head * H;
+
+    extern __shared__ float sram[];
+    float* k_block = sram;              // (Bc, H)
+    float* v_block = sram + (Bc * H);   // (Bc, H)
+
+    float qi[H];
+    float oi[H];
+    if (row_valid) {
+#pragma unroll
+        for (int x = 0; x < H; ++x) qi[x] = q[q_off + x];
+    }
+#pragma unroll
+    for (int x = 0; x < H; ++x) oi[x] = 0.0f;
+
+    float m_prev = -CUDART_INF_F;
+    float l_prev = 0.0f;
+
+    const int Tc = (k_len + Bc - 1) / Bc;
+    const int q_global_max = start_pos + q_tile * Br + (Br - 1);
+
+    for (int jt = 0; jt < Tc; ++jt) {
+        // All remaining KV tiles are invisible to every row in this q tile.
+        if (jt * Bc > q_global_max) break;
+
+        // Cooperative load of K/V tile (Bc, H); out-of-range rows are zeroed.
+        for (int i = tid; i < Bc * H; i += Br) {
+            const int r = i / H;
+            const int col = i % H;
+            const int row_g = jt * Bc + r;
+            if (row_g < k_len) {
+                const float* kbase;
+                const float* vbase;
+                if (k_paged) {
+                    const int slot = paged::block_slot(block_tables, s, max_blocks, row_g, block_size);
+                    kbase = k + (long)slot * D + (long)kv_head * H;
+                    vbase = v + (long)slot * D + (long)kv_head * H;
+                } else {
+                    const long off = (long)(kv_start + row_g) * D + (long)kv_head * H;
+                    kbase = k + off;
+                    vbase = v + off;
+                }
+                k_block[i] = kbase[col];
+                v_block[i] = vbase[col];
+            } else {
+                k_block[i] = 0.0f;
+                v_block[i] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        if (row_valid) {
+            float m_curr = -CUDART_INF_F;
+            float sc[Bc];
+
+            // 1. S = q·Kᵀ * scale, with causal + range mask.
+            for (int y = 0; y < Bc; ++y) {
+                const int kv_idx = jt * Bc + y;
+                const bool visible = (kv_idx < k_len) && (q_global >= kv_idx);
+                float score = -CUDART_INF_F;
+                if (visible) {
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int x = 0; x < H; ++x) sum += qi[x] * k_block[y * H + x];
+                    score = sum * scale;
+                }
+                sc[y] = score;
+                m_curr = fmaxf(m_curr, score);
+            }
+
+            // 2. p = exp(s - m_curr), running sum.
+            float l_curr = 0.0f;
+            for (int y = 0; y < Bc; ++y) {
+                const float p = (sc[y] == -CUDART_INF_F) ? 0.0f : __expf(sc[y] - m_curr);
+                sc[y] = p;
+                l_curr += p;
+            }
+
+            // 3. Online rescale + accumulate P·V.
+            if (m_curr != -CUDART_INF_F) {
+                const float m_new = fmaxf(m_prev, m_curr);
+                const float alpha = __expf(m_prev - m_new);
+                const float beta = __expf(m_curr - m_new);
+                const float l_new = alpha * l_prev + beta * l_curr;
+                for (int x = 0; x < H; ++x) {
+                    float pv = 0.0f;
+                    for (int y = 0; y < Bc; ++y) pv += sc[y] * v_block[y * H + x];
+                    oi[x] = (alpha * l_prev * oi[x] + beta * pv) / l_new;
+                }
+                m_prev = m_new;
+                l_prev = l_new;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (row_valid) {
+        const bool write = (l_prev > 0.0f);
+#pragma unroll
+        for (int x = 0; x < H; ++x) o[q_off + x] = write ? oi[x] : 0.0f;
+    }
     (void)num_seqs; (void)max_seqlen_q; (void)max_seqlen_k;
-    (void)q_heads; (void)kv_heads; (void)block_size; (void)max_blocks;
-    (void)k_paged; (void)scale;
 }
 
 template <const int H>
@@ -170,22 +267,57 @@ __global__ void flash_attn_decode_kernel(
     int max_blocks,
     float scale
 ) {
-    // TODO(user): implement.
-    //
-    // Suggested grid = (num_seqs, q_heads), block = (32)  -> one warp per head.
-    //   lane splits head_size (H / 32 elements each).
-    //   L  = context_lens[s];  kv_head = q_head / (q_heads / kv_heads);
-    //   loop j in [0, L):
-    //       idx = block_slot(block_tables, s, max_blocks, j, block_size);
-    //       k = k_cache + idx * kv_heads*H + kv_head*H;
-    //       v = v_cache + idx * kv_heads*H + kv_head*H;
-    //       dot = warp_reduce_sum(sum_lane q_l * k_l);  score = dot * scale;
-    //       online softmax update acc/l/m.
-    //   o[s, q_head, :] = acc / l.
-    (void)q; (void)k_cache; (void)v_cache; (void)o;
-    (void)block_tables; (void)context_lens;
-    (void)num_seqs; (void)q_heads; (void)kv_heads;
-    (void)block_size; (void)max_blocks; (void)scale;
+    constexpr int ELEMS = H / 32;  // head-dim elements handled per lane
+
+    const int s = blockIdx.x;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (warp >= q_heads) return;
+    const int q_head = warp;
+
+    const int group_size = q_heads / kv_heads;
+    const int kv_head = q_head / group_size;
+    const int D = kv_heads * H;
+    const int L = context_lens[s];
+
+    const long q_off = (long)s * q_heads * H + (long)q_head * H;
+
+    float qi[ELEMS];
+    float acc[ELEMS];
+#pragma unroll
+    for (int e = 0; e < ELEMS; ++e) {
+        qi[e] = q[q_off + lane + e * 32];
+        acc[e] = 0.0f;
+    }
+
+    float m = -CUDART_INF_F;
+    float l = 0.0f;
+
+    for (int j = 0; j < L; ++j) {
+        const int slot = paged::block_slot(block_tables, s, max_blocks, j, block_size);
+        const float* kbase = k_cache + (long)slot * D + (long)kv_head * H;
+        const float* vbase = v_cache + (long)slot * D + (long)kv_head * H;
+
+        float partial = 0.0f;
+#pragma unroll
+        for (int e = 0; e < ELEMS; ++e) partial += qi[e] * kbase[lane + e * 32];
+        const float dot = paged::warp_reduce_sum(partial);
+        const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+
+        const float m_new = fmaxf(m, score);
+        const float alpha = __expf(m - m_new);
+        const float p = __expf(score - m_new);
+        l = l * alpha + p;
+#pragma unroll
+        for (int e = 0; e < ELEMS; ++e) acc[e] = acc[e] * alpha + p * vbase[lane + e * 32];
+        m = m_new;
+    }
+
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+#pragma unroll
+    for (int e = 0; e < ELEMS; ++e) o[q_off + lane + e * 32] = acc[e] * inv;
+
+    (void)num_seqs;
 }
 
 template <const int H>
