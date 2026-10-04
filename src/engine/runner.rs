@@ -63,34 +63,56 @@ impl ModelRunner {
         let mut context_lens = None;
         let mut block_tables = None;
 
+        // 对每个 seq 
         for seq in seqs {
-            // A sequence is split into [cached prefix, uncached suffix].
+            /*
+                A sequence is split into [cached prefix, uncached suffix].
+                取出 seq 中无法命中前缀缓存的部分 token ids
+                同时这部分 token ids 在原来 seq 中的逻辑索引
+                例如第一个 block 命中缓存
+                [432, 43, ..., 31, 89, 322]
+                [256, 257, ..., 510, 511]
+            */
             input_ids.extend(seq.token_ids[seq.num_cached_tokens..].iter().map(|&t| t as i32));
             positions.extend(seq.num_cached_tokens as i32..seq.len() as i32);
 
-            // Only the uncached suffix produces queries; keys cover the whole sequence.
+            // seqlen_q：总长度 - 缓存 token 数量 = 需要处理的 tokens
             let seqlen_q = seq.len() - seq.num_cached_tokens;
             let seqlen_k = seq.len();
 
+            /* 
+                因为 input_ids 和 positions 是扁平的，多个 seq 都是一维的，需要记录下
+                cu_seqlens_x 就是用来做这个的，每次在原来的最后一个位置加上本轮的长度：
+                [0, 8, 12, 21] 对应长度：[8, 4, 9] 三个 seq 的长度
+            */
             cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + seqlen_q as i32);
             cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + seqlen_k as i32);
 
             max_seqlen_q = max_seqlen_q.max(seqlen_q);
             max_seqlen_k = max_seqlen_k.max(seqlen_k);
 
-            // Slots for the uncached blocks (their tokens must be written).
+            // 对当前 seq 中，每个没有被 cache 的 block（需要计算 kv），记录下他们的 slot 位置
             for i in seq.num_cached_blocks()..seq.num_blocks() {
+                // 逻辑 i block，对应物理 block 的号为 seq.block_table[i]
+                // seq.block_table[i] * BLOCK_SIZE 是 token 的 slot 号
                 let start = seq.block_table[i] * BLOCK_SIZE;
+                // 如果是最后一个，end 只有部分，否则沾满整个 block
                 let end = if i != seq.num_blocks() - 1 { start + BLOCK_SIZE } else { start + seq.last_block().len() };
+                // slot mapping 插入这个 block 内部所有 token 的 slot 索引
                 slot_mapping.extend(start as i32..end as i32);
             }
+
+            // positions 和 slot_mapping，在每次新加入一个 seq，增加的长度都是没有 cache 的 tokens 数量
+            // 前者是逻辑 token 索引，后者是物理索引
+            // 这个新增加的长度：seq.len() - seq.num_cached_tokens 被保存到了 cu_seqlens_q 中！
         }
 
         assert_eq!(input_ids.len(), *cu_seqlens_q.last().unwrap() as usize);
         assert_eq!(input_ids.len(), slot_mapping.len());
 
-        // Prefix cache is present iff some sequence has cached KV beyond its queries.
+        // 如果这个 seq 有前缀缓存
         if cu_seqlens_k.last().unwrap() > cu_seqlens_q.last().unwrap() {
+            // 记录每个 seq 的长度
             let seq_lens: Vec<i32> = seqs.iter().map(|s| s.len() as i32).collect();
             context_lens = Some(Tensor::<Cuda, Int>::new(seq_lens, &self.dev)?);
             block_tables = Some(self.prepare_block_tables(seqs)?);
@@ -123,10 +145,12 @@ impl ModelRunner {
         let mut context_lens: Vec<i32> = vec![];
 
         for seq in seqs {
+            // decode 阶段，要处理的 ids 就是 seq 的最后一个 tokens
             input_ids.push(seq.last_token() as i32);
-            // Matches the local nano-vllm reference (note: upstream uses len-1).
+            // 记录这个 token 的逻辑 token 索引
             positions.push(seq.len() as i32);
             context_lens.push(seq.len() as i32);
+            // 计算这个 token 的物理 token 索引。做法是找这个 token 的页表（最后一个） * BLOCK_SIZE + 最后一个块内索引
             slot_mapping.push((seq.block_table.last().unwrap() * BLOCK_SIZE + seq.last_block().len() - 1) as i32);
         }
 
@@ -155,8 +179,6 @@ impl ModelRunner {
     }
 
     /// Allocate the single paged KV cache tensor and build the per-layer
-    /// [`Attention`] components that view into it.
-    ///
     /// Shape: `(2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)`.
     pub fn allocate_kv_cache(&mut self) -> anyhow::Result<()> {
         let (free, total) = self.dev.mem_get_info();
@@ -201,6 +223,7 @@ impl ModelRunner {
         Ok(())
     }
 
+    /// 将输入 seqs 的 block table 整理为 2 维的 Tensor（num_seq, max_len），max_len 是所有 seq 中 block 最大的
     fn prepare_block_tables(&mut self, seqs: &[&Sequence]) -> anyhow::Result<Tensor<Cuda, Int>> {
         let max_len = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(0);
 
