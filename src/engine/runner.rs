@@ -3,7 +3,7 @@ use std::path::Path;
 use luma::{Cuda, FloatDType, IndexOp, Int, Tensor, tensor::IntTensor};
 
 use crate::{
-    components::{Attention, Context},
+    models::{components::Attention, Context},
     config::Config,
     engine::{BLOCK_SIZE, Sequence},
     models::Sampler,

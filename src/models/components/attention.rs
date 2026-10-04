@@ -1,6 +1,5 @@
 use luma::{Cuda, Float, Tensor};
-
-use crate::components::Context;
+use crate::models::Context;
 use crate::kernels;
 
 /// Paged attention component, mirroring `nanovllm/layers/attention.py`.

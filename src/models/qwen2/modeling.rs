@@ -1,5 +1,6 @@
 use super::Qwen2Config;
-use crate::components::{Attention, Context as AttnContext};
+use crate::models::components::Attention;
+use crate::models::Context as AttnContext;
 use anyhow::Context;
 use luma::nn::{Buffer, Embedding, EmbeddingConfig, Init, Linear, LinearConfig, Module, RMSNorm, RMSNormConfig};
 use luma::{
