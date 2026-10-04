@@ -36,29 +36,43 @@ impl Sampler {
     pub fn reasoning() -> Self {
         Self::new(0.4, 0.85, 20)
     }
-}
 
-impl Sampler {
-    pub fn sample<Dev: Device>(&self, logits: &Tensor<Dev>) -> anyhow::Result<u32> {
-        let mut logits: Vec<_> = logits.to_vec()?;
+    pub fn temperature(&self) -> f64 {
+        self.temperature
+    }
 
-        // temperature = 0, greedy sample
-        if self.temperature <= 0.0 {
-            return Ok(self.argmax(&logits));
+    /// Sample one token per row of `logits` (`(num_seqs, vocab)`).
+    ///
+    /// `temperatures` is per sequence; a value `<= 0` means greedy. When fewer
+    /// temperatures than rows are given, the sampler's default is used.
+    pub fn sample<Dev: Device>(&self, logits: &Tensor<Dev>, temperatures: &[f64]) -> anyhow::Result<Vec<u32>> {
+        let dims = logits.dims();
+        anyhow::ensure!(!dims.is_empty(), "sample: empty logits shape");
+        let vocab = *dims.last().unwrap();
+        let flat = logits.to_vec()?;
+        anyhow::ensure!(vocab > 0, "sample: vocab must be positive");
+        let rows = flat.len() / vocab;
+
+        let mut tokens = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let logits = &flat[row * vocab..(row + 1) * vocab];
+            let temperature = temperatures.get(row).copied().unwrap_or(self.temperature);
+            tokens.push(self.sample_row(logits, temperature));
+        }
+        Ok(tokens)
+    }
+
+    fn sample_row(&self, logits: &[f64], temperature: f64) -> u32 {
+        // temperature <= 0: greedy
+        if temperature <= 0.0 {
+            return self.argmax(logits);
         }
 
-        // temerature scaling
-        for x in &mut logits {
-            *x /= self.temperature;
-        }
-        // softmax
-        let probs = self.softmax(&logits);
-
-        // top-k & top-p sampling
+        // temperature scaling
+        let scaled: Vec<f64> = logits.iter().map(|x| x / temperature).collect();
+        let probs = self.softmax(&scaled);
         let filtered_probs = self.apply_top_k_top_p(probs);
-
-        // multinomial sampling
-        Ok(self.multinomial_sample(&filtered_probs))
+        self.multinomial_sample(&filtered_probs)
     }
 
     fn argmax(&self, logits: &[f64]) -> u32 {
@@ -117,6 +131,6 @@ impl Sampler {
             }
         }
 
-        unreachable!()
+        sorted_probs.last().map(|(index, _)| *index).unwrap_or(0)
     }
 }

@@ -139,6 +139,10 @@ impl Qwen2Config {
         self
     }
 
+    pub fn head_size(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+
     pub fn intermediate_size(&self) -> usize {
         match self.intermediate_size {
             Some(intermediate_size) => intermediate_size,

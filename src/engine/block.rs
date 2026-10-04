@@ -29,6 +29,27 @@ impl BlockManager {
         }
     }
 
+    /// Whether `seq` (a fresh prefill request) can get all its blocks.
+    pub fn can_allocate(&self, seq: &Sequence) -> bool {
+        self.free_block_ids.len() >= seq.num_blocks()
+    }
+
+    /// Whether the next decode token can be appended (a new block is needed
+    /// only when the sequence crosses a block boundary).
+    pub fn can_append(&self, seq: &Sequence) -> bool {
+        /*
+            seq.len() % self.block_size -> 总长度对 block_size 取余
+            如果刚好一个：刚加入的 token id，需要申请一个新 block，所以要求 free_block_ids 至少有一个
+            但如果是 != 1，不需要申请，就肯定可以
+        */
+        let remid = seq.len() % BLOCK_SIZE;
+        if remid == 1 {
+            self.free_block_ids.len() >= 1
+        } else {
+            true
+        }
+    }
+
     /// 新请求到达，给 seq 分配 block_table，返回这次复用了多少 token
     /// 空间不足就返回失败
     pub fn allocate(&mut self, seq: &mut Sequence) -> Result<usize> {

@@ -82,5 +82,6 @@ fn generate<Dev: Device>(
 fn sample_last<Dev: Device>(sampler: &Sampler, logits: &Tensor<Dev>) -> anyhow::Result<u32> {
     let (_, seq, _) = logits.dims3().context("logits dims3")?;
     let last = logits.narrow(1, seq - 1, 1).context("narrow last logits")?.contiguous().context("contiguous logits")?;
-    sampler.sample(&last)
+    let tokens = sampler.sample(&last, &[sampler.temperature()]).context("sample last")?;
+    Ok(tokens[0])
 }

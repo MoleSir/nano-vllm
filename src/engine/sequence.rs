@@ -8,10 +8,11 @@ pub struct SamplingParams {
     pub ignore_eos: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceStatus {
-    Watting,
+    Waiting,
     Running,
-    Finsied,
+    Finished,
 }
 
 /// 表示一个完整请求
@@ -35,7 +36,7 @@ impl Sequence {
         let num_prompt_tokens = token_ids.len();
         Self {
             id: COUNTER.fetch_add(1, Ordering::Relaxed),
-            status: SequenceStatus::Watting,
+            status: SequenceStatus::Waiting,
             token_ids: token_ids,
             // 由 BlockManager 维护:已经算完(或复用了缓存)的 token 数
             num_cached_tokens: 0,
@@ -58,6 +59,10 @@ impl Sequence {
     /// 保存下 token_ids 这么多 token 最少要多少 block
     pub fn num_blocks(&self) -> usize {
         (self.token_ids.len() + BLOCK_SIZE - 1) / BLOCK_SIZE
+    }
+
+    pub fn num_cached_blocks(&self) -> usize {
+        self.num_cached_tokens / BLOCK_SIZE
     }
 
     pub fn last_token(&self) -> u32 {

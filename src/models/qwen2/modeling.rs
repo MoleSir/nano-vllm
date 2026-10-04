@@ -1,4 +1,5 @@
 use super::Qwen2Config;
+use crate::components::{Attention, Context as AttnContext};
 use anyhow::Context;
 use luma::nn::{Buffer, Embedding, EmbeddingConfig, Init, Linear, LinearConfig, Module, RMSNorm, RMSNormConfig};
 use luma::{
@@ -40,6 +41,49 @@ impl<Dev: Device> Qwen2ForCausalLM<Dev> {
         let hidden_states = self.model.forward(input_ids, start_pos, cache).context("model forward")?;
 
         // (batch_size, seq_len, hidden_size) => (batch_size, seq_len, vocab_size)
+        let logits = match &self.lm_head {
+            Some(lm_head) => lm_head.forward(&hidden_states).context("lm head forward")?,
+            None => {
+                let wte_weight = &self.model.embed_tokens.weight;
+                luma::nn::functional::linear(&hidden_states, wte_weight, None).context("tied lm head forward")?
+            }
+        };
+
+        Ok(logits)
+    }
+}
+
+impl Qwen2ForCausalLM<luma::Cuda> {
+    /// Paged forward used by the engine's model runner.
+    ///
+    /// - `input_ids`, `positions`: flattened tokens/rope positions for this step.
+    /// - `ctx`: paged-attention metadata built by `ModelRunner`.
+    /// - `attn`: per-layer paged attention components (own the K/V cache views).
+    ///
+    /// Returns logits `(num_seqs, vocab)`: for prefill, only each sequence's last
+    /// token is projected (matching nano-vllm's `ParallelLMHead`); for decode,
+    /// every row is projected.
+    pub fn forward_paged(
+        &self,
+        input_ids: &IntTensor<luma::Cuda>,
+        positions: &IntTensor<luma::Cuda>,
+        ctx: &AttnContext,
+        attn: &[Attention],
+    ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        let hidden_states = self.model.forward_paged(input_ids, positions, ctx, attn).context("model forward_paged")?;
+
+        let hidden_states = if ctx.is_prefill {
+            let cu_seqlens_q = ctx.cu_seqlens_q.as_ref().context("prefill missing cu_seqlens_q")?;
+            let cu = cu_seqlens_q.to_vec().context("cu_seqlens_q to_vec")?;
+            // last token index of each sequence: cu_seqlens_q[1:] - 1
+            let indices: Vec<i64> = cu.windows(2).map(|w| w[1] - 1).collect();
+            let indices = IntTensor::<luma::Cuda>::from_slice(&indices, indices.len(), (hidden_states.device(), IntDType::I32))
+                .context("last-token indices")?;
+            hidden_states.index_select(&indices, 0).context("select last-token hidden states")?
+        } else {
+            hidden_states
+        };
+
         let logits = match &self.lm_head {
             Some(lm_head) => lm_head.forward(&hidden_states).context("lm head forward")?,
             None => {
@@ -329,6 +373,83 @@ impl<Dev: Device> Qwen2Attention<Dev> {
     }
 }
 
+// ============================================================================================ //
+//     Paged forward (CUDA only) — mirrors nanovllm/layers/attention.py
+// ============================================================================================ //
+
+impl Qwen2Attention<luma::Cuda> {
+    /// `x`: `(num_tokens, hidden)`, `positions`: `(num_tokens,)`.
+    pub fn forward_paged(
+        &self,
+        x: &Tensor<luma::Cuda>,
+        positions: &IntTensor<luma::Cuda>,
+        ctx: &AttnContext,
+        attn: &Attention,
+        rope: &Qwen2Rope<luma::Cuda>,
+    ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        let num_tokens = x.dims()[0];
+
+        let q = self.q_proj.forward(x).context("attention q_proj forward")?;
+        let k = self.k_proj.forward(x).context("attention k_proj forward")?;
+        let v = self.v_proj.forward(x).context("attention v_proj forward")?;
+
+        let q = q.reshape((num_tokens, self.num_attention_heads, self.head_size)).context("q reshape")?;
+        let k = k.reshape((num_tokens, self.num_key_value_heads, self.head_size)).context("k reshape")?;
+        let v = v.reshape((num_tokens, self.num_key_value_heads, self.head_size)).context("v reshape")?;
+
+        // TODO: Qwen2 has no q_norm/k_norm; add them here for Qwen3.
+        let q = rope.apply_rotary_emb_positions(&q, positions).context("rope q")?;
+        let k = rope.apply_rotary_emb_positions(&k, positions).context("rope k")?;
+
+        let o = attn.forward(&q, &k, &v, ctx).context("paged attention forward")?;
+        let o = o.reshape((num_tokens, self.num_attention_heads * self.head_size)).context("attn flatten")?;
+        let out = self.o_proj.forward(&o).context("attention o_proj forward")?;
+        Ok(out)
+    }
+}
+
+impl Qwen2Layer<luma::Cuda> {
+    pub fn forward_paged(
+        &self,
+        hidden_states: &Tensor<luma::Cuda>,
+        positions: &IntTensor<luma::Cuda>,
+        ctx: &AttnContext,
+        attn: &Attention,
+        rope: &Qwen2Rope<luma::Cuda>,
+    ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        let residual = hidden_states.clone();
+        let hidden_states = self.input_layernorm.forward(hidden_states).context("input layernorm forward")?;
+        let hidden_states = self.self_attn.forward_paged(&hidden_states, positions, ctx, attn, rope).context("self attention forward")?;
+        let hidden_states = residual + hidden_states;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_layernorm.forward(&hidden_states).context("post-attention layernorm forward")?;
+        let hidden_states = self.mlp.forward(&hidden_states).context("mlp forward")?;
+        let hidden_states = residual + hidden_states;
+
+        Ok(hidden_states)
+    }
+}
+
+impl Qwen2Model<luma::Cuda> {
+    pub fn forward_paged(
+        &self,
+        input_ids: &IntTensor<luma::Cuda>,
+        positions: &IntTensor<luma::Cuda>,
+        ctx: &AttnContext,
+        attn: &[Attention],
+    ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids).context("embed_tokens forward")?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer
+                .forward_paged(&hidden_states, positions, ctx, &attn[i], &self.rope)
+                .with_context(|| format!("layer {i} forward_paged"))?;
+        }
+        let hidden_states = self.norm.forward(&hidden_states).context("final rms norm forward")?;
+        Ok(hidden_states)
+    }
+}
+
 #[derive(Module)]
 pub struct Qwen2Rope<Dev: Device> {
     pub sin: Buffer<Dev, Float>,
@@ -377,6 +498,31 @@ impl<Dev: Device> Qwen2Rope<Dev> {
         let x_rotated = self.rotate_half(x).context("rotate_half")?;
         let x_out = x.broadcast_mul(&cos).context("rope x * cos")? + x_rotated.broadcast_mul(&sin).context("rope x_rotated * sin")?;
         Ok(x_out)
+    }
+
+    /// Per-token RoPE for the paged path.
+    ///
+    /// `x`: `(num_tokens, num_heads, head_dim)`, `positions`: `(num_tokens,)`.
+    pub fn apply_rotary_emb_positions(&self, x: &Tensor<Dev>, positions: &IntTensor<Dev>) -> anyhow::Result<Tensor<Dev>> {
+        let (num_tokens, _n_heads, head_size) = x.dims3().context("apply_rotary_emb_positions dims3")?;
+        let sin = self.sin.index_select(positions, 0).context("rope gather sin")?; // (num_tokens, head_size)
+        let cos = self.cos.index_select(positions, 0).context("rope gather cos")?; // (num_tokens, head_size)
+        let sin = sin.reshape((num_tokens, 1, head_size)).context("rope sin reshape")?;
+        let cos = cos.reshape((num_tokens, 1, head_size)).context("rope cos reshape")?;
+
+        let x_rotated = self.rotate_half_last(x).context("rotate_half_last")?;
+        let x_out = x.broadcast_mul(&cos).context("rope x * cos")? + x_rotated.broadcast_mul(&sin).context("rope x_rotated * sin")?;
+        Ok(x_out)
+    }
+
+    /// `[x1, x2] -> [-x2, x1]` along the last dim, for any rank.
+    fn rotate_half_last(&self, x: &Tensor<Dev>) -> anyhow::Result<Tensor<Dev>> {
+        let head_size = *x.dims().last().context("rotate_half_last empty dims")?;
+        let half_size = head_size / 2;
+        let x1 = x.narrow(D::Minus1, 0, half_size).context("rotate_half_last narrow x1")?;
+        let x2 = x.narrow(D::Minus1, half_size, half_size).context("rotate_half_last narrow x2")?;
+        let neg_x2 = x2.neg().context("rotate_half_last neg x2")?;
+        Ok(Tensor::cat(&[&neg_x2, &x1], D::Minus1).context("rotate_half_last cat")?)
     }
 
     fn rotate_half(&self, x: &Tensor<Dev>) -> anyhow::Result<Tensor<Dev>> {
