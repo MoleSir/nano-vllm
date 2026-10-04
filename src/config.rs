@@ -9,7 +9,7 @@ pub struct Config {
     pub model: String,
 
     #[builder(default = 32768)]
-    pub max_num_batched_tokens: usize,
+    pub max_batched_tokens: usize,
 
     #[builder(default = 512)]
     pub max_num_seqs: usize,
@@ -24,7 +24,7 @@ pub struct Config {
     pub enforce_eager: bool,
 
     #[builder(default = 0)]
-    pub eos: u32,
+    pub eos_token_id: u32,
 
     #[builder(default = 256)]
     pub kvcache_block_size: usize,

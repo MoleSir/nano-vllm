@@ -74,9 +74,9 @@ fn add(engine: &mut LLMEngine, tokenizer: &Tokenizer, user: &str, max_tokens: us
     let enc = tokenizer
         .encode(&prompt, EncodeOptions { add_special_tokens: false, ..Default::default() })
         .context("encode")?;
-    engine.add_request_tokens(
+    engine.add_token_request(
         enc.get_ids().to_vec(),
-        SamplingParams { temperature: 0.0, max_tokens, ignore_eos: false },
+        SamplingParams { temperature: 0.0, max_new_tokens: max_tokens, ignore_eos: false },
     );
     Ok(())
 }

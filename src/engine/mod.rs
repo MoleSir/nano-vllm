@@ -6,16 +6,18 @@ pub use block::*;
 pub use runner::*;
 pub use scheduler::*;
 pub use sequence::*;
-pub use sequence::SamplingParams;
 
 use luma::Cuda;
-use crate::{
-    config::Config,
-    engine::{ModelRunner, Scheduler, Sequence, SequenceStatus},
-    tokenizer::{EncodeOptions, Tokenizer},
-};
+use crate::{config::Config, tokenizer::{EncodeOptions, Tokenizer}};
 
 pub const BLOCK_SIZE: usize = 256;
+
+/// 本步批次的阶段：prefill（变长打包）或 decode（每序列一个 token）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    Prefill,
+    Decode,
+}
 
 pub struct LLMEngine {
     pub config: Config,
@@ -29,7 +31,7 @@ impl LLMEngine {
         anyhow::ensure!(config.kvcache_block_size % 256 == 0, "kvcache_block_size 必须是 256 的倍数");
 
         let tokenizer = Tokenizer::from_file(&config.model)?;
-        config.eos = tokenizer.eos_token_id();
+        config.eos_token_id = tokenizer.eos_token_id();
 
         let dev = Cuda::new(0)?;
         let model_runner = ModelRunner::new(config.clone(), dev)?;
@@ -43,12 +45,12 @@ impl LLMEngine {
 
     pub fn add_request(&mut self, prompt: &str, sampling_params: SamplingParams) -> anyhow::Result<()> {
         let encoding = self.tokenizer.encode(prompt, EncodeOptions::default())?;
-        self.scheduler.add_seq(Sequence::new(encoding.get_ids().to_vec(), sampling_params));
+        self.scheduler.enqueue(Sequence::new(encoding.get_ids().to_vec(), sampling_params));
         Ok(())
     }
 
-    pub fn add_request_tokens(&mut self, token_ids: Vec<u32>, sampling_params: SamplingParams) {
-        self.scheduler.add_seq(Sequence::new(token_ids, sampling_params));
+    pub fn add_token_request(&mut self, token_ids: Vec<u32>, sampling_params: SamplingParams) {
+        self.scheduler.enqueue(Sequence::new(token_ids, sampling_params));
     }
 
     pub fn is_finished(&self) -> bool {
@@ -59,27 +61,14 @@ impl LLMEngine {
     ///
     /// Returns `(seq_id, completion_token_ids)` for sequences finished this step.
     pub fn step(&mut self) -> anyhow::Result<Vec<(usize, Vec<u32>)>> {
-        let (seqs, is_prefill) = self.scheduler.schedule()?;
-
-        let token_ids = {
-            let guards: Vec<_> = seqs.iter().map(|seq| seq.read().expect("seq read")).collect();
-            let refs: Vec<&Sequence> = guards.iter().map(|guard| &**guard).collect();
-            self.model_runner.run(&refs, is_prefill)?
-        };
-
-        self.scheduler.post_forward(&seqs, is_prefill);
-        self.scheduler.post_process(&seqs, &token_ids);
-
-        let outputs = seqs
-            .iter()
-            .filter_map(|seq| {
-                let guard = seq.read().expect("seq read");
-                (guard.status == SequenceStatus::Finished)
-                    .then(|| (guard.id, guard.token_ids[guard.num_prompt_tokens..].to_vec()))
-            })
-            .collect();
-
-        Ok(outputs)
+        // 1. 要求 scheduler 调度
+        let mut batch = self.scheduler.schedule()?;
+        // 2. 要求模型 forward， 每个 seq 得到一个 u32 作为下一个 token
+        let token_ids = self.model_runner.forward_batch(&batch.seqs, batch.phase)?;
+        // 3. cache 刚计算的 tokens
+        self.scheduler.register_computed(&mut batch);
+        // 4. 得到一组 id + 生成的 token id（如果有 seq 以及结束，返回 id + 所有生成的 token）
+        Ok(self.scheduler.append_sampled(batch, &token_ids))
     }
 
     /// Run until all requests finish; returns `(seq_id, completion_token_ids)` sorted by id.

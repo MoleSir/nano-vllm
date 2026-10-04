@@ -1,8 +1,29 @@
 use std::collections::{HashMap, VecDeque};
+
 use super::{BLOCK_SIZE, Sequence};
 use crate::error::{OutOfBlocks, Result};
+
 pub type BlockId = usize;
 pub type Hash = u64;
+
+// ===========================================================================
+//  状态模型
+//
+//  一个物理块（BlockId，对应一段 KV cache 显存）始终处于两个池之一：
+//
+//    - free 池：无引用。元素类型 `FreeBlock` 只会是 `Free` / `FreeCached`，
+//      **不可能是在用块**——这点由类型保证，取出时不必再判断 `Live`。
+//    - live 池（`slots` 中的 `Some`）：被 >=1 个序列引用。
+//
+//  「归属（refs）」与「内容缓存（hash）」是两个正交维度：
+//    Free       : refs=0, 未登记
+//    FreeCached : refs=0, 已登记（可被同前缀复用）
+//    Exclusive  : refs=1, 未登记（独占，不可共享）
+//    Cached     : refs>=1, 已登记（可被同前缀共享）
+//
+//  未登记的块一定独占（refs=1）：只有内容登记进 `hash_index` 后，才可能被
+//  另一个序列通过前缀命中而 `refs += 1`。
+// ===========================================================================
 
 /// 空闲块（引用计数为 0）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,9 +45,9 @@ impl FreeBlock {
 /// 在用块（引用计数 >= 1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveBlock {
-    /// refs = 1，内容尚未登记，不可共享
+    /// refs = 1，内容尚未登记 —— 不可共享
     Exclusive,
-    /// refs >= 1，内容已登记，可被同前缀请求共享
+    /// refs >= 1，内容已登记 —— 可被同前缀请求共享
     Cached { refs: usize, hash: Hash },
 }
 
@@ -37,31 +58,31 @@ struct CachedEntry {
     token_ids: Box<[u32]>,
 }
 
-/// `probe` 的命中结果：直接告诉 `commit` 该怎么落地，避免再次回查状态。
+/// `plan_prefix` 的命中结果：直接告诉 `apply_plan` 该怎么落地，避免再次回查状态。
 #[derive(Clone, Copy, Debug)]
-enum CachedHit {
+enum PrefixHit {
     /// 命中一个在用块：`refs += 1`
     Share(BlockId),
     /// 命中一个空闲缓存块：从 free 池摘回，变成独占在用
-    Reclaim { id: BlockId, hash: Hash },
+    Reuse { id: BlockId, hash: Hash },
 }
 
-struct Plan {
-    cached: Vec<CachedHit>,
-    num_fresh_blocks: usize,
+struct AllocationPlan {
+    hits: Vec<PrefixHit>,
+    fresh_blocks: usize,
 }
 
-impl Plan {
-    fn num_cached_tokens(&self) -> usize {
-        self.cached.len() * BLOCK_SIZE
+impl AllocationPlan {
+    fn reused_tokens(&self) -> usize {
+        self.hits.len() * BLOCK_SIZE
     }
 }
 
 pub struct BlockManager {
     /// 物理块表：`None` = 空闲（其状态保存在 free 池里），`Some` = 在用
-    blocks: Vec<Option<LiveBlock>>,
+    slots: Vec<Option<LiveBlock>>,
     /// 空闲池：元素只可能是 `Free` / `FreeCached`，按回收顺序（FIFO 驱逐）
-    free: VecDeque<FreeBlock>,
+    free_blocks: VecDeque<FreeBlock>,
     /// 内容索引：hash -> (块, token_ids)，同时包含在用与空闲两类已登记块
     hash_index: HashMap<Hash, CachedEntry>,
 }
@@ -69,93 +90,93 @@ pub struct BlockManager {
 impl BlockManager {
     pub fn new(num_blocks: usize) -> Self {
         Self {
-            // 初始化所有 Block 都是 None 空闲
-            blocks: (0..num_blocks).map(|_| None).collect(),
-            // 初始化所有的 free 
-            free: (0..num_blocks).map(|id| FreeBlock::Free { id }).collect(),
+            slots: (0..num_blocks).map(|_| None).collect(),
+            free_blocks: (0..num_blocks).map(|id| FreeBlock::Free { id }).collect(),
             hash_index: HashMap::new(),
         }
     }
 
-    /// Whether `seq` (a fresh prefill request) can get all its blocks.
-    pub fn can_allocate(&self, seq: &Sequence) -> bool {
-        self.free.len() >= seq.num_blocks()
+    /// 一条【待 prefill】的 seq（prompt 尚未进入 KV）能否装下它需要的全部块。
+    pub fn can_reserve_prefill(&self, seq: &Sequence) -> bool {
+        self.free_blocks.len() >= seq.needed_blocks()
     }
 
-    /// Whether the next decode token can be appended (a new block is needed
-    /// only when the sequence crosses a block boundary).
-    pub fn can_append(&self, seq: &Sequence) -> bool {
+    /// decode 追加一个 token 后是否需要新块、以及现在是否拿得出。
+    pub fn can_extend_for_token(&self, seq: &Sequence) -> bool {
+        // 调用这个函数的时候，之前插入过 token，修改了 seq.len()，但这个 token 还没有申请 block。
+        // 所以是判断 remid == 1。
+        // 后续的逻辑是：extend_for_token 申请一个 block，但这个 block 还没有写任何 kvcache
+        // 因为就这个 token 是新得到的，kvcache 都还没计算，直到下次 attention 就会算出这个 token 的向量，然后写入到 全局 kvcache
         let remid = seq.len() % BLOCK_SIZE;
         if remid == 1 {
-            self.free.len() >= 1
+            self.free_blocks.len() >= 1
         } else {
             true
         }
     }
 
-    /// 新请求到达，给 seq 分配 block_table，返回这次复用了多少 token。
-    /// 空间不足就返回失败，且不改动任何状态（probe 无副作用）。
-    pub fn allocate(&mut self, seq: &mut Sequence) -> Result<usize> {
-        let plan = self.probe(seq)?;
-        let num_cached_tokens = plan.num_cached_tokens();
-        self.commit(seq, plan);
-        Ok(num_cached_tokens)
+    /// 为一条【待 prefill】的 seq 预留全部所需块，并尽力复用公共前缀的缓存。
+    /// 前置条件：`seq.cached_len == 0` 且 `block_table` 为空。
+    /// 空间不足时返回失败，且不改动任何状态。
+    pub fn reserve_prefill(&mut self, seq: &mut Sequence) -> Result<()> {
+        debug_assert_eq!(seq.cached_len, 0, "reserve_prefill 只用于尚未 prefill 的序列");
+        let plan = self.plan_prefix(seq)?;
+        self.apply_plan(seq, plan);
+        Ok(())
     }
 
-    /// 释放这个 seq 中的 block
-    pub fn deallocate(&mut self, seq: &mut Sequence) {
-        // 释放 seq 的所有 block，遍历 seq 的 block table
+    /// 释放这个 seq 中的全部块（结束或抢占时调用）。
+    pub fn release(&mut self, seq: &mut Sequence) {
         for &id in seq.block_table.iter().rev() {
-            // 取出这个 block，判断其状态（暂时将 id 位置设置为空闲）
-            match self.blocks[id].take() {
-                // block 独占，释放很简单，直接插入 free 队列，由于之前独占，也不可以共享，直接完全 Free
+            match self.slots[id].take() {
                 Some(LiveBlock::Exclusive) => {
-                    self.free.push_back(FreeBlock::Free { id });
+                    self.free_blocks.push_back(FreeBlock::Free { id });
                 }
-                // block 正在被贡献，同时引用计数大于 1，释放很简单，这个位置不可以被释放，修改 refs 即可
                 Some(LiveBlock::Cached { refs, hash }) if refs > 1 => {
-                    self.blocks[id] = Some(LiveBlock::Cached { refs: refs - 1, hash });
+                    self.slots[id] = Some(LiveBlock::Cached { refs: refs - 1, hash });
                 }
-                // block 正在被贡献，同时引用计数 == 1，需要被释放
                 Some(LiveBlock::Cached { hash, .. }) => {
-                    // 由于这个 block 是 hash 的，可以转为 FreeCached 用于之后的复用
-                    self.free.push_back(FreeBlock::FreeCached { id, hash });
+                    self.free_blocks.push_back(FreeBlock::FreeCached { id, hash });
                 }
                 None => unreachable!("releasing an already-free block {id}"),
             }
         }
-        seq.num_cached_tokens = 0;
+        seq.cached_len = 0;
         seq.block_table.clear();
     }
 
-    /// 每次 prefill/decode 得到一个 append token 后调用。
-    /// token 跨过块边界就补一个新块。空间不足时返回失败且不改状态。
-    pub fn append_tokens(&mut self, seq: &mut Sequence) -> Result<()> {
-        let needed = seq.num_blocks() - seq.block_table.len();
+    /// 【decode】追加一个 token 后，若跨过块边界则补一个新块。
+    /// 前置条件：`block_table` 已经覆盖到 `len - 1`。
+    pub fn extend_for_token(&mut self, seq: &mut Sequence) -> Result<()> {
+        let needed = seq.needed_blocks() - seq.block_table.len();
         if needed == 0 {
             return Ok(());
         }
-        if self.free.len() < needed {
-            return Err(OutOfBlocks { needed, free: self.free.len() }.into());
+        if self.free_blocks.len() < needed {
+            return Err(OutOfBlocks { needed, free: self.free_blocks.len() }.into());
         }
         for _ in 0..needed {
-            seq.block_table.push(self.take_free());
+            seq.block_table.push(self.take_free_block());
         }
         Ok(())
     }
 
     /// forward 算完之后调用，把这次新写满的块登记进缓存目录，别的序列才能复用。
-    pub fn on_computed(&mut self, seq: &mut Sequence, num_computed: usize) {
-        let start = seq.num_cached_tokens / BLOCK_SIZE;
-        let end = (seq.num_cached_tokens + num_computed) / BLOCK_SIZE;
-        seq.num_cached_tokens += num_computed;
+    pub fn register_computed(&mut self, seq: &mut Sequence, num_computed: usize) {
+        // 找到还没有 cached 的 block，之前的 block 都 cached 过了
+        let start = seq.cached_len / BLOCK_SIZE;
+        // cached_len 后增加 num_computed 个 token
+        let end = (seq.cached_len + num_computed) / BLOCK_SIZE;
+        // 总 cached 数量增加
+        seq.cached_len += num_computed;
+        // 如果增加的 cache 数量不会满出一个 token，啥也不用干
         if start == end {
             return;
         }
 
         // 前缀链：第 start 个块的 hash 接在它前一个块上（若存在）。
         let mut h = if start > 0 {
-            match &self.blocks[seq.block_table[start - 1]] {
+            match &self.slots[seq.block_table[start - 1]] {
                 Some(LiveBlock::Cached { hash, .. }) => Some(*hash),
                 _ => unreachable!("previous block must be registered before its successor"),
             }
@@ -163,146 +184,131 @@ impl BlockManager {
             None
         };
 
+        // 对这些 cache 但还没 hash 的 block
         for i in start..end {
+            // 取出这个 block id
             let id = seq.block_table[i];
-            let token_ids: Box<[u32]> = seq.block(i).to_vec().into_boxed_slice();
+            // 这个 block 已经满了，可以 hash
+            let token_ids: Box<[u32]> = seq.token_block(i).to_vec().into_boxed_slice();
             let cur_h = compute_hash(&token_ids, h);
             h = Some(cur_h);
-            debug_assert!(self.blocks[id].is_some(), "登记一个空闲块 {id}");
-            self.blocks[id] = Some(LiveBlock::Cached { refs: 1, hash: cur_h });
+            debug_assert!(self.slots[id].is_some(), "登记一个空闲块 {id}");
+            // 更新，从 Exclusive -> Cached
+            self.slots[id] = Some(LiveBlock::Cached { refs: 1, hash: cur_h });
+            // 增加 hash 
             self.hash_index.insert(cur_h, CachedEntry { id, token_ids });
         }
     }
-}
 
-impl BlockManager {
     /// 为一个新到来的请求（只有 prompt 部分）探测前缀复用方案。
     /// 纯读，不产生任何副作用；失败时调用方保证状态不变。
-    fn probe(&self, seq: &Sequence) -> Result<Plan> {
-        let num_blocks = seq.num_blocks();
-        let mut cached = Vec::new();
+    fn plan_prefix(&self, seq: &Sequence) -> Result<AllocationPlan> {
+        let needed = seq.needed_blocks();
+        let mut hits = Vec::new();
         let mut h = None;
         let mut num_cached_free_blocks = 0usize;
 
         // 只复用写满的块（最后一块往往是半块，不共享）。
-        for i in 0..num_blocks.saturating_sub(1) {
-            // 为当前 块 计算 hash（包含前缀）
-            let token_ids = seq.block(i);
+        for i in 0..needed.saturating_sub(1) {
+            let token_ids = seq.token_block(i);
             let cur_h = compute_hash(token_ids, h);
             h = Some(cur_h);
 
-            // 命中条件：hash 在索引里，且 token id 完全一致
+            // 命中条件：hash 在索引里，且 token id 逐一对上（防 hash 冲突）。
             let Some(entry) = self.hash_index.get(&cur_h) else { break };
             if entry.token_ids.as_ref() != token_ids {
                 break;
             }
 
-            // 通过 hash 得到缓存命中的 block id，我们希望使用 entry.id 这个 Block
-            // 有两种情况：1. 复用之前的 block；2. 需要一个新 block（有 hash 的）
-            match &self.blocks[entry.id] {
-                // 复用已经存在的
-                Some(LiveBlock::Cached { .. }) => cached.push(CachedHit::Share(entry.id)),
-                // 之前的代码会保证不可能出现独占的 block 会被尝试共享
+            match &self.slots[entry.id] {
+                Some(LiveBlock::Cached { .. }) => hits.push(PrefixHit::Share(entry.id)),
                 Some(_) => unreachable!("hash_index points at a non-cached live block"),
-                // 复用之前存在的（Hash 还没删除）
                 None => {
-                    cached.push(CachedHit::Reclaim { id: entry.id, hash: cur_h });
+                    hits.push(PrefixHit::Reuse { id: entry.id, hash: cur_h });
                     num_cached_free_blocks += 1;
                 }
             }
         }
 
-        // num_fresh_blocks：不可以被缓存的 block 数量
-        let num_fresh_blocks = num_blocks - cached.len();
+        let fresh_blocks = needed - hits.len();
         // 需要从 free 池取出的块 = 命中的空闲缓存块 + 全新块
-        let num_free_blocks_needed = num_cached_free_blocks + num_fresh_blocks;
-        if self.free.len() < num_free_blocks_needed {
-            return Err(OutOfBlocks { needed: num_free_blocks_needed, free: self.free.len() }.into());
+        let num_free_blocks_needed = num_cached_free_blocks + fresh_blocks;
+        if self.free_blocks.len() < num_free_blocks_needed {
+            return Err(OutOfBlocks { needed: num_free_blocks_needed, free: self.free_blocks.len() }.into());
         }
-        Ok(Plan { cached, num_fresh_blocks })
+        Ok(AllocationPlan { hits, fresh_blocks })
     }
 
-    /// 把 plan 变成 seq 的 block_table
-    fn commit(&mut self, seq: &mut Sequence, plan: Plan) {
-        let num_cached_blocks = plan.cached.len();
-        let num_fresh_blocks = plan.num_fresh_blocks;
-        let mut block_table = Vec::with_capacity(num_cached_blocks + num_fresh_blocks);
+    /// 把 plan 变成 seq 的 block_table，并把复用的前缀长度写进 `seq.cached_len`。
+    fn apply_plan(&mut self, seq: &mut Sequence, plan: AllocationPlan) {
+        let reused_len = plan.reused_tokens();
+        let fresh_blocks = plan.fresh_blocks;
+        let mut block_table = Vec::with_capacity(plan.hits.len() + fresh_blocks);
 
-        // 先插入 cached 的 block，还是两种情况：复用 shared / 从 free 取出之前 hash 过还没删除的
-        for hit in plan.cached {
+        for hit in plan.hits {
             match hit {
-                // 复用 shared block，只需增加引用计数
-                CachedHit::Share(id) => {
-                    match &mut self.blocks[id] {
+                PrefixHit::Share(id) => {
+                    match &mut self.slots[id] {
                         Some(LiveBlock::Cached { refs, .. }) => *refs += 1,
-                        // 之前的代码会保证不可能出现独占的 block 会被尝试共享
                         _ => unreachable!("Share hit on a non-cached block {id}"),
                     }
                     block_table.push(id);
                 }
-                // 从 free 中取出这个复用 hash 
-                CachedHit::Reclaim { id, hash } => {
+                PrefixHit::Reuse { id, hash } => {
                     // 从空闲池摘回来继续用，内容不变。
-                    self.free.retain(|fb| fb.id() != id);
-                    // id 位置从 free 回到共享状态
-                    self.blocks[id] = Some(LiveBlock::Cached { refs: 1, hash });
+                    self.free_blocks.retain(|fb| fb.id() != id);
+                    self.slots[id] = Some(LiveBlock::Cached { refs: 1, hash });
                     block_table.push(id);
                 }
             }
         }
 
-        // 剩下 block 直接去申请
-        for _ in 0..num_fresh_blocks {
-            block_table.push(self.take_free());
+        for _ in 0..fresh_blocks {
+            block_table.push(self.take_free_block());
         }
 
-        seq.num_cached_tokens = num_cached_blocks * BLOCK_SIZE;
+        seq.cached_len = reused_len;
         seq.block_table = block_table;
     }
 
     /// 从 free 池取出最早的空闲块并置为在用（未登记）。
     /// 若取到的是带缓存的空闲块，说明内容即将被覆盖，先作废它的索引条目。
-    fn take_free(&mut self) -> BlockId {
-        // 取出最早 free 的 block
-        let free = self.free.pop_front().expect("empty free list");
-        // free 有两种状态：1. 完全 free；2. 已经没有使用了，但 hash 还在（用于前缀缓存命中）
+    fn take_free_block(&mut self) -> BlockId {
+        let free = self.free_blocks.pop_front().expect("empty free list");
         let id = match free {
-            // 完全 free 的 block
             FreeBlock::Free { id } => id,
-            // hash 信息还在，要申请这个 block，需要删除之前的 hash 信息
             FreeBlock::FreeCached { id, hash } => {
                 debug_assert_eq!(self.hash_index.get(&hash).map(|e| e.id), Some(id));
                 self.hash_index.remove(&hash);
                 id
             }
         };
-        // 刚申请的 block 只能独占，还没填满 token id 
-        self.blocks[id] = Some(LiveBlock::Exclusive);
+        self.slots[id] = Some(LiveBlock::Exclusive);
         id
     }
 
-    /// 测试用：校验 free 池 / blocks / hash_index 三者一致。
+    /// 测试用：校验 free 池 / slots / hash_index 三者一致。
     #[cfg(test)]
     fn check_invariants(&self) {
         use std::collections::HashSet;
         let mut in_free = HashSet::new();
-        for fb in &self.free {
+        for fb in &self.free_blocks {
             let id = fb.id();
             assert!(in_free.insert(id), "free 池出现重复 id {id}");
-            assert!(self.blocks[id].is_none(), "free 池里的 {id} 却是 live");
+            assert!(self.slots[id].is_none(), "free 池里的 {id} 却是 live");
         }
-        for (id, block) in self.blocks.iter().enumerate() {
+        for (id, block) in self.slots.iter().enumerate() {
             if block.is_some() {
                 assert!(!in_free.contains(&id), "live 块 {id} 同时出现在 free 池");
             }
         }
         for (h, entry) in &self.hash_index {
             assert_eq!(entry.token_ids.len(), BLOCK_SIZE, "登记的块必须写满");
-            match &self.blocks[entry.id] {
+            match &self.slots[entry.id] {
                 Some(LiveBlock::Cached { hash, .. }) => assert_eq!(hash, h),
                 Some(_) => panic!("hash_index 指向非 Cached 的在用块 {}", entry.id),
                 None => assert!(
-                    self.free
+                    self.free_blocks
                         .iter()
                         .any(|fb| matches!(fb, FreeBlock::FreeCached { id, hash } if *id == entry.id && hash == h)),
                     "hash_index 指向不存在的空闲缓存块 {}",
@@ -337,9 +343,9 @@ mod tests {
     /// 模拟一次「分配 + 前向算完」:分配 block_table,并把算完的块登记进缓存
     fn prefill(bm: &mut BlockManager, token_ids: Vec<u32>) -> Sequence {
         let mut seq = Sequence::new(token_ids, SamplingParams::default());
-        bm.allocate(&mut seq).expect("空闲块不够");
-        let num_computed = seq.len() - seq.num_cached_tokens;
-        bm.on_computed(&mut seq, num_computed);
+        bm.reserve_prefill(&mut seq).expect("空闲块不够");
+        let num_computed = seq.uncached_len();
+        bm.register_computed(&mut seq, num_computed);
         seq
     }
 
@@ -351,7 +357,7 @@ mod tests {
         assert_eq!(seq.block_table.len(), 2);
         assert_eq!(bm.hash_index.len(), 1, "只有写满的块能进 hash 表");
         assert!(
-            matches!(bm.blocks[seq.block_table[1]], Some(LiveBlock::Exclusive)),
+            matches!(bm.slots[seq.block_table[1]], Some(LiveBlock::Exclusive)),
             "尾块必须独占"
         );
         bm.check_invariants();
@@ -362,17 +368,17 @@ mod tests {
         let mut bm = BlockManager::new(16);
         let a = prefill(&mut bm, tokens(0..300));
 
-        // 白盒看一眼探测结果(allocate 内部就是它)
+        // 白盒看一眼探测结果(reserve_prefill 内部就是它)
         let mut b = Sequence::new(tokens(0..300), SamplingParams::default());
-        let plan = bm.probe(&b).expect("空闲块不够");
-        assert_eq!(plan.cached.len(), 1, "只有写满的第 0 块能命中");
-        assert_eq!(plan.num_fresh_blocks, 1, "尾块要新分配");
+        let plan = bm.plan_prefix(&b).expect("空闲块不够");
+        assert_eq!(plan.hits.len(), 1, "只有写满的第 0 块能命中");
+        assert_eq!(plan.fresh_blocks, 1, "尾块要新分配");
 
-        let num_cached_tokens = bm.allocate(&mut b).expect("空闲块不够");
-        assert_eq!(num_cached_tokens, BLOCK_SIZE);
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
+        assert_eq!(b.cached_len, BLOCK_SIZE);
         assert_eq!(b.block_table[0], a.block_table[0]);
         assert!(
-            matches!(bm.blocks[a.block_table[0]], Some(LiveBlock::Cached { refs: 2, .. })),
+            matches!(bm.slots[a.block_table[0]], Some(LiveBlock::Cached { refs: 2, .. })),
             "被共享的块 refs 应该 +1"
         );
         assert_ne!(b.block_table[1], a.block_table[1], "尾块不共享");
@@ -384,16 +390,16 @@ mod tests {
         let mut bm = BlockManager::new(8);
         let mut a = prefill(&mut bm, tokens(0..600)); // 2 个满块 + 88 token 的尾块
         let a_blocks = a.block_table.clone();
-        bm.deallocate(&mut a); // A 结束:块回空闲队列,内容还在
+        bm.release(&mut a); // A 结束:块回空闲队列,内容还在
 
         // 命中的两块都是「空闲但带缓存」的状态 —— 它们也要占空闲队列的名额
         let mut b = Sequence::new(tokens(0..600), SamplingParams::default());
-        let num_cached_tokens = bm.allocate(&mut b).expect("空闲块不够");
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
 
-        assert_eq!(num_cached_tokens, 2 * BLOCK_SIZE);
+        assert_eq!(b.cached_len, 2 * BLOCK_SIZE);
         assert_eq!(b.block_table.len(), 3, "block_table 长度必须等于总块数");
         assert_eq!(&b.block_table[..2], &a_blocks[..2], "前两块直接复用");
-        assert_eq!(bm.free.len(), 5, "3 个块都从空闲队列里拿");
+        assert_eq!(bm.free_blocks.len(), 5, "3 个块都从空闲队列里拿");
         bm.check_invariants();
     }
 
@@ -402,19 +408,19 @@ mod tests {
         let mut bm = BlockManager::new(2);
         let mut a = prefill(&mut bm, tokens(0..300)); // 块 0 写满并登记
         assert_eq!(bm.hash_index.len(), 1);
-        bm.deallocate(&mut a); // 空闲,但缓存还在
+        bm.release(&mut a); // 空闲,但缓存还在
 
         // 一个毫不相干的序列把块拿走 —— 内容即将被覆盖,映射必须作废
         let mut b = Sequence::new(tokens(1000..1300), SamplingParams::default());
-        bm.allocate(&mut b).expect("空闲块不够");
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
 
         assert!(bm.hash_index.is_empty(), "被覆盖的块不能再留着缓存映射");
         assert!(
-            bm.free.iter().all(|fb| matches!(fb, FreeBlock::Free { .. })),
+            bm.free_blocks.iter().all(|fb| matches!(fb, FreeBlock::Free { .. })),
             "不应再有带缓存的空闲块"
         );
         assert!(
-            bm.blocks.iter().all(|b| !matches!(b, Some(LiveBlock::Cached { .. }))),
+            bm.slots.iter().all(|b| !matches!(b, Some(LiveBlock::Cached { .. }))),
             "不应再有已登记的在用块"
         );
         bm.check_invariants();
@@ -424,14 +430,14 @@ mod tests {
     fn cached_free_blocks_count_toward_the_budget() {
         let mut bm = BlockManager::new(4);
         let mut a = prefill(&mut bm, tokens(0..600)); // 3 块全用掉
-        bm.deallocate(&mut a); // 都回到空闲队列,前两块带着缓存
+        bm.release(&mut a); // 都回到空闲队列,前两块带着缓存
 
         let mut c = Sequence::new(tokens(1000..1300), SamplingParams::default()); // 占 2 块
-        bm.allocate(&mut c).expect("空闲块不够");
+        bm.reserve_prefill(&mut c).expect("空闲块不够");
 
         let mut b = Sequence::new(tokens(0..600), SamplingParams::default());
         // 命中 2 块(空闲但带缓存,要摘回来)+ 1 个新块 = 3 > 剩下的 2 块
-        let Error::OutOfBlocks(e) = bm.allocate(&mut b).unwrap_err();
+        let Error::OutOfBlocks(e) = bm.reserve_prefill(&mut b).unwrap_err();
         assert_eq!((e.needed, e.free), (3, 2));
         assert!(b.block_table.is_empty(), "失败不能留下半截 block_table");
         bm.check_invariants();
@@ -451,8 +457,8 @@ mod tests {
         let e = prefill(&mut bm, [q, y.clone(), z.clone()].concat()); // 不同前缀,同样的 y
 
         let mut b = Sequence::new([p0, y, z].concat(), SamplingParams::default());
-        let num_cached_tokens = bm.allocate(&mut b).expect("空闲块不够");
-        assert_eq!(num_cached_tokens, 2 * BLOCK_SIZE);
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
+        assert_eq!(b.cached_len, 2 * BLOCK_SIZE);
 
         assert_eq!(b.block_table[1], c.block_table[1], "同前缀的 y 块才能复用");
         assert_ne!(b.block_table[1], e.block_table[1], "不同前缀的 y 块不能复用");
@@ -463,46 +469,46 @@ mod tests {
     fn failed_allocation_leaves_state_untouched() {
         let mut bm = BlockManager::new(2);
         let mut a = Sequence::new(tokens(0..300), SamplingParams::default());
-        bm.allocate(&mut a).expect("应该能装下"); // 2 个块全用掉
+        bm.reserve_prefill(&mut a).expect("应该能装下"); // 2 个块全用掉
 
         let mut b = Sequence::new(tokens(1000..2000), SamplingParams::default()); // 要 4 块
-        let free_before = bm.free.clone();
-        let Error::OutOfBlocks(e) = bm.allocate(&mut b).unwrap_err();
+        let free_before = bm.free_blocks.clone();
+        let Error::OutOfBlocks(e) = bm.reserve_prefill(&mut b).unwrap_err();
         assert_eq!((e.needed, e.free), (4, 0));
 
-        assert_eq!(bm.free, free_before, "失败不能动空闲队列");
+        assert_eq!(bm.free_blocks, free_before, "失败不能动空闲队列");
         assert!(b.block_table.is_empty(), "失败不能留下半截 block_table");
         bm.check_invariants();
     }
 
     #[test]
-    fn append_tokens_grows_block_table_at_boundary() {
+    fn extend_for_token_grows_block_table_at_boundary() {
         let mut bm = BlockManager::new(4);
         let mut seq = prefill(&mut bm, tokens(0..255)); // 1 块,还没写满
         assert_eq!(seq.block_table.len(), 1);
 
-        seq.append_token(9999); // 256 个 token:还是 1 块
-        bm.append_tokens(&mut seq).expect("不该失败");
+        seq.push_token(9999); // 256 个 token:还是 1 块
+        bm.extend_for_token(&mut seq).expect("不该失败");
         assert_eq!(seq.block_table.len(), 1);
 
-        seq.append_token(9999); // 257 个 token:要第 2 块了
-        bm.append_tokens(&mut seq).expect("不该失败");
+        seq.push_token(9999); // 257 个 token:要第 2 块了
+        bm.extend_for_token(&mut seq).expect("不该失败");
         assert_eq!(seq.block_table.len(), 2);
         assert!(
-            matches!(bm.blocks[seq.block_table[1]], Some(LiveBlock::Exclusive)),
+            matches!(bm.slots[seq.block_table[1]], Some(LiveBlock::Exclusive)),
             "新尾块独占"
         );
         bm.check_invariants();
     }
 
     #[test]
-    fn append_tokens_fails_cleanly_when_out_of_blocks() {
+    fn extend_for_token_fails_cleanly_when_out_of_blocks() {
         let mut bm = BlockManager::new(1);
         let mut seq = prefill(&mut bm, tokens(0..256)); // 唯一的块,正好写满
         let table_before = seq.block_table.clone();
 
-        seq.append_token(1); // 跨块,但没有空闲块了
-        assert!(bm.append_tokens(&mut seq).is_err());
+        seq.push_token(1); // 跨块,但没有空闲块了
+        assert!(bm.extend_for_token(&mut seq).is_err());
         assert_eq!(seq.block_table, table_before, "失败不能动 block_table");
         bm.check_invariants();
     }
@@ -510,25 +516,25 @@ mod tests {
     // ---- 状态迁移 -----------------------------------------------------------
 
     #[test]
-    fn take_free_from_empty_and_cached() {
+    fn take_free_block_from_empty_and_cached() {
         let mut bm = BlockManager::new(2);
         let mut a = prefill(&mut bm, tokens(0..300)); // 块0 登记,块1 尾块
         let cached_id = a.block_table[0];
-        bm.deallocate(&mut a); // free = [块1(Free), 块0(FreeCached)]
+        bm.release(&mut a); // free = [块1(Free), 块0(FreeCached)]
 
-        assert!(bm.free.iter().any(|fb| matches!(fb, FreeBlock::FreeCached { id, .. } if *id == cached_id)));
-        assert!(bm.free.iter().any(|fb| matches!(fb, FreeBlock::Free { .. })));
+        assert!(bm.free_blocks.iter().any(|fb| matches!(fb, FreeBlock::FreeCached { id, .. } if *id == cached_id)));
+        assert!(bm.free_blocks.iter().any(|fb| matches!(fb, FreeBlock::Free { .. })));
 
         // 取走纯空块：不影响 hash_index
-        let first = bm.take_free();
-        assert!(matches!(bm.blocks[first], Some(LiveBlock::Exclusive)));
+        let first = bm.take_free_block();
+        assert!(matches!(bm.slots[first], Some(LiveBlock::Exclusive)));
         assert_eq!(bm.hash_index.len(), 1);
 
         // 取走缓存空闲块：必须摘掉它的 hash_index 条目
-        let second = bm.take_free();
+        let second = bm.take_free_block();
         assert_eq!(second, cached_id);
         assert!(bm.hash_index.is_empty());
-        assert!(matches!(bm.blocks[second], Some(LiveBlock::Exclusive)));
+        assert!(matches!(bm.slots[second], Some(LiveBlock::Exclusive)));
         bm.check_invariants();
     }
 
@@ -537,9 +543,9 @@ mod tests {
         let mut bm = BlockManager::new(8);
         let a = prefill(&mut bm, tokens(0..300));
         let mut b = Sequence::new(tokens(0..300), SamplingParams::default());
-        bm.allocate(&mut b).expect("空闲块不够");
-        assert!(matches!(bm.blocks[a.block_table[0]], Some(LiveBlock::Cached { refs: 2, .. })));
-        assert!(matches!(bm.blocks[a.block_table[1]], Some(LiveBlock::Exclusive)));
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
+        assert!(matches!(bm.slots[a.block_table[0]], Some(LiveBlock::Cached { refs: 2, .. })));
+        assert!(matches!(bm.slots[a.block_table[1]], Some(LiveBlock::Exclusive)));
         bm.check_invariants();
     }
 
@@ -548,16 +554,16 @@ mod tests {
         let mut bm = BlockManager::new(8);
         let mut a = prefill(&mut bm, tokens(0..300));
         let mut b = Sequence::new(tokens(0..300), SamplingParams::default());
-        bm.allocate(&mut b).expect("空闲块不够");
+        bm.reserve_prefill(&mut b).expect("空闲块不够");
         let shared_id = a.block_table[0];
-        assert!(matches!(bm.blocks[shared_id], Some(LiveBlock::Cached { refs: 2, .. })));
+        assert!(matches!(bm.slots[shared_id], Some(LiveBlock::Cached { refs: 2, .. })));
 
-        bm.deallocate(&mut b); // refs 2 -> 1,仍在使用
-        assert!(matches!(bm.blocks[shared_id], Some(LiveBlock::Cached { refs: 1, .. })));
+        bm.release(&mut b); // refs 2 -> 1,仍在使用
+        assert!(matches!(bm.slots[shared_id], Some(LiveBlock::Cached { refs: 1, .. })));
 
-        bm.deallocate(&mut a); // refs 1 -> 0,变成空闲缓存块
-        assert!(bm.blocks[shared_id].is_none());
-        assert!(bm.free.iter().any(|fb| matches!(fb, FreeBlock::FreeCached { id, .. } if *id == shared_id)));
+        bm.release(&mut a); // refs 1 -> 0,变成空闲缓存块
+        assert!(bm.slots[shared_id].is_none());
+        assert!(bm.free_blocks.iter().any(|fb| matches!(fb, FreeBlock::FreeCached { id, .. } if *id == shared_id)));
         bm.check_invariants();
     }
 }

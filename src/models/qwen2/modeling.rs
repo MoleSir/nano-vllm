@@ -1,4 +1,5 @@
 use super::Qwen2Config;
+use crate::engine::Phase;
 use crate::models::components::Attention;
 use crate::models::Context as AttnContext;
 use anyhow::Context;
@@ -71,20 +72,31 @@ impl Qwen2ForCausalLM<luma::Cuda> {
         ctx: &AttnContext,
         attn: &[Attention],
     ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        // (num_tokens,) -> (num_tokens, hidden_size)
         let hidden_states = self.model.forward_paged(input_ids, positions, ctx, attn).context("model forward_paged")?;
-
-        let hidden_states = if ctx.is_prefill {
+        
+        // (num_tokens, hidden_size) -> (num_tokens, hidden_size)
+        let hidden_states = if ctx.phase == Phase::Prefill {
+            // prefill 阶段的结果，取出 cu_seqlen_q
             let cu_seqlens_q = ctx.cu_seqlens_q.as_ref().context("prefill missing cu_seqlens_q")?;
             let cu = cu_seqlens_q.to_vec().context("cu_seqlens_q to_vec")?;
-            // last token index of each sequence: cu_seqlens_q[1:] - 1
+
+            // cu_seqlens_q 两个元素之差是每个 seq 的输入 q 长度，w[l] - 1 表示每个 seq 的最后一个 token 位置
             let indices: Vec<i64> = cu.windows(2).map(|w| w[1] - 1).collect();
             let indices = IntTensor::<luma::Cuda>::from_slice(&indices, indices.len(), (hidden_states.device(), IntDType::I32))
                 .context("last-token indices")?;
+            
+            /*
+                hidden_states: (num_tokens, hidden_size)，表示每个 token 输出的特征向量
+                indices: (num_seq)，表示每个 seq 最后一个 token 位置
+                调用 index_select 就可以从所有 hidden_states 取出最后一个 token 的预测输出，用来给每个 seq 预测下一个 token
+            */
             hidden_states.index_select(&indices, 0).context("select last-token hidden states")?
         } else {
             hidden_states
         };
 
+        // (num_seq, hidden_size) -> (num_seq, vocab_size)
         let logits = match &self.lm_head {
             Some(lm_head) => lm_head.forward(&hidden_states).context("lm head forward")?,
             None => {
@@ -390,7 +402,9 @@ impl Qwen2Attention<luma::Cuda> {
     ) -> anyhow::Result<Tensor<luma::Cuda>> {
         let num_tokens = x.dims()[0];
 
+        // (num_tokens, hidden_size) => (num_tokens, q_num_heads, head_size)
         let q = self.q_proj.forward(x).context("attention q_proj forward")?;
+        // (num_tokens, hidden_size) => (num_tokens, kv_num_heads, head_size)
         let k = self.k_proj.forward(x).context("attention k_proj forward")?;
         let v = self.v_proj.forward(x).context("attention v_proj forward")?;
 
@@ -398,7 +412,7 @@ impl Qwen2Attention<luma::Cuda> {
         let k = k.reshape((num_tokens, self.num_key_value_heads, self.head_size)).context("k reshape")?;
         let v = v.reshape((num_tokens, self.num_key_value_heads, self.head_size)).context("v reshape")?;
 
-        // TODO: Qwen2 has no q_norm/k_norm; add them here for Qwen3.
+        // (num_tokens, q_num_heads, head_size) / (num_tokens, kv_num_heads, head_size)
         let q = rope.apply_rotary_emb_positions(&q, positions).context("rope q")?;
         let k = rope.apply_rotary_emb_positions(&k, positions).context("rope k")?;
 
@@ -418,6 +432,7 @@ impl Qwen2Layer<luma::Cuda> {
         attn: &Attention,
         rope: &Qwen2Rope<luma::Cuda>,
     ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        // (num_tokens, hidden_size)
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states).context("input layernorm forward")?;
         let hidden_states = self.self_attn.forward_paged(&hidden_states, positions, ctx, attn, rope).context("self attention forward")?;
@@ -440,10 +455,10 @@ impl Qwen2Model<luma::Cuda> {
         ctx: &AttnContext,
         attn: &[Attention],
     ) -> anyhow::Result<Tensor<luma::Cuda>> {
+        // (num_tokens,) -> (num_tokens, hidden_size)
         let mut hidden_states = self.embed_tokens.forward(input_ids).context("embed_tokens forward")?;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden_states = layer
-                .forward_paged(&hidden_states, positions, ctx, &attn[i], &self.rope)
+            hidden_states = layer.forward_paged(&hidden_states, positions, ctx, &attn[i], &self.rope)
                 .with_context(|| format!("layer {i} forward_paged"))?;
         }
         let hidden_states = self.norm.forward(&hidden_states).context("final rms norm forward")?;
@@ -502,7 +517,6 @@ impl<Dev: Device> Qwen2Rope<Dev> {
     }
 
     /// Per-token RoPE for the paged path.
-    ///
     /// `x`: `(num_tokens, num_heads, head_dim)`, `positions`: `(num_tokens,)`.
     pub fn apply_rotary_emb_positions(&self, x: &Tensor<Dev>, positions: &IntTensor<Dev>) -> anyhow::Result<Tensor<Dev>> {
         let (num_tokens, _n_heads, head_size) = x.dims3().context("apply_rotary_emb_positions dims3")?;
