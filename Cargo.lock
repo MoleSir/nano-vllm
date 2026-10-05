@@ -1109,7 +1109,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "luma-compile"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eac26a4c13d665bcbc72417fdbc95ba32271e85152b46f540684fac0efc5dbbd"
 dependencies = [
  "luma-cpu",
  "luma-cuda",
@@ -1122,7 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "luma-cpu"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3dfa72e14f843f9dae86c559be239c5022c8ad4faca471857a435e308f9cc39"
 dependencies = [
  "bytemuck",
  "gemm",
@@ -1137,7 +1141,9 @@ dependencies = [
 
 [[package]]
 name = "luma-cuda"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fd24b6bd3e55398774a13dbc0db1cbcb02f70f50bd46bc3cac7be5589af55d2"
 dependencies = [
  "bindgen_cuda",
  "bytemuck",
@@ -1151,7 +1157,9 @@ dependencies = [
 
 [[package]]
 name = "luma-dataset"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9a49f2cc2180ed6004ade2a5b600b0f9361c3638528048dca7bc30727cdecde"
 dependencies = [
  "dirs",
  "flate2",
@@ -1166,7 +1174,9 @@ dependencies = [
 
 [[package]]
 name = "luma-flash-attn"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aecf5b1914ed192d6d956bd4bfa30b27a929134acc70a4b239e6363bd41ad83"
 dependencies = [
  "cudarc",
  "half",
@@ -1177,7 +1187,9 @@ dependencies = [
 
 [[package]]
 name = "luma-io"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0d92227e4a08b391cfa0d2b58dd6d844d8f9d0d53b8270c3f7b437def37980a"
 dependencies = [
  "luma-tensor",
  "memmap2",
@@ -1188,7 +1200,9 @@ dependencies = [
 
 [[package]]
 name = "luma-kit"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfde6c3412053d96caa6f94656c22388270fcda815ba838e6483c33f110d2ced"
 dependencies = [
  "luma-compile",
  "luma-cpu",
@@ -1202,7 +1216,9 @@ dependencies = [
 
 [[package]]
 name = "luma-macros"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9522485839676e753c464acd62d5b5ed2fe52d2b3b1888be90218c7c35aa1ec0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1212,7 +1228,9 @@ dependencies = [
 
 [[package]]
 name = "luma-nn"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbc95273fd36b30259bba6e6757987dcc7a2ce5eaf25636e3bb785f6a46a39e7"
 dependencies = [
  "luma-cuda",
  "luma-flash-attn",
@@ -1225,7 +1243,9 @@ dependencies = [
 
 [[package]]
 name = "luma-optim"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b61d688fe9a8d0e0ca6c683ee5867dbf73ac21618fdb9112a18c21165a48636d"
 dependencies = [
  "luma-io",
  "luma-tensor",
@@ -1235,7 +1255,9 @@ dependencies = [
 
 [[package]]
 name = "luma-tensor"
-version = "0.3.0"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f9213d76cd8a05b9344258048419cffe604a2030d2ae66e0577bebddd2f32c4"
 dependencies = [
  "bytemuck",
  "half",
@@ -1317,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.3"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
  "wasi",

@@ -7,8 +7,8 @@ edition = "2024"
 bytemuck = "1.25.2"
 thiserror = "2.0.21"
 xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
-luma-kit = { path = "../luma/luma", features = ["cuda", "nn"] }
-luma-flash-attn = { path = "../luma/luma-flash-attn" }
+luma-kit = { version = "0.3.2", features = ["cuda", "nn"] }
+luma-flash-attn = "0.3.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"

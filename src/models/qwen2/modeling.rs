@@ -1,7 +1,5 @@
 use super::Qwen2Config;
-use crate::engine::Phase;
-use crate::models::components::Attention;
-use crate::models::Context as AttnContext;
+use crate::models::components::{Attention, AttnContext, AttnState};
 use anyhow::Context;
 use std::path::Path;
 use luma::nn::{Buffer, Embedding, EmbeddingConfig, Init, Linear, LinearConfig, Module, RMSNorm, RMSNormConfig};
@@ -109,10 +107,10 @@ impl Qwen2ForCausalLM<luma::Cuda> {
         let hidden_states = self.model.forward_paged(input_ids, positions, ctx, attn).context("model forward_paged")?;
         
         // (num_tokens, hidden_size) -> (num_tokens, hidden_size)
-        let hidden_states = if ctx.phase == Phase::Prefill {
+
+        let hidden_states = if let AttnState::Prefill(state) = &ctx.state {
             // prefill 阶段的结果，取出 cu_seqlen_q
-            let cu_seqlens_q = ctx.cu_seqlens_q.as_ref().context("prefill missing cu_seqlens_q")?;
-            let cu = cu_seqlens_q.to_vec().context("cu_seqlens_q to_vec")?;
+            let cu = state.cu_seqlens_q.to_vec().context("cu_seqlens_q to_vec")?;
 
             // cu_seqlens_q 两个元素之差是每个 seq 的输入 q 长度，w[l] - 1 表示每个 seq 的最后一个 token 位置
             let indices: Vec<i64> = cu.windows(2).map(|w| w[1] - 1).collect();

@@ -1,14 +1,11 @@
 use std::path::Path;
-
 use luma::{Cuda, DType, IndexOp, Int, Tensor, tensor::IntTensor};
-
 use crate::{
     config::Config,
     engine::{BLOCK_SIZE, Phase, Sequence},
     models::{
-        components::Attention,
+        components::{Attention, AttnContext, AttnState, DecodeState, PrefillState},
         qwen2::{Qwen2Config, Qwen2ForCausalLM},
-        Context,
     },
 };
 
@@ -64,7 +61,7 @@ impl ModelRunner {
     }
 
     /// 为一系列需要 prefill 的 seq 准备输入
-    pub fn build_prefill(&mut self, seqs: &[Sequence]) -> anyhow::Result<(IntTensor<Cuda>, IntTensor<Cuda>, Context)> {
+    pub fn build_prefill(&mut self, seqs: &[Sequence]) -> anyhow::Result<(IntTensor<Cuda>, IntTensor<Cuda>, AttnContext)> {
         let mut input_ids: Vec<i32> = vec![];
         let mut positions: Vec<i32> = vec![];
         let mut cu_seqlens_q = vec![0i32];
@@ -122,7 +119,7 @@ impl ModelRunner {
         assert_eq!(input_ids.len(), slot_mapping.len());
 
         // Attention 统一从分页 cache 读取（新 K/V 已写入），因此 prefill 也始终需要 block table。
-        let block_tables = Some(self.prepare_block_tables(seqs)?);
+        let block_tables = self.prepare_block_tables(seqs)?;
 
         let input_ids = Tensor::<Cuda, Int>::new(input_ids, &self.dev)?;
         let positions = Tensor::<Cuda, Int>::new(positions, &self.dev)?;
@@ -130,21 +127,18 @@ impl ModelRunner {
         let cu_seqlens_k = Tensor::<Cuda, Int>::new(cu_seqlens_k, &self.dev)?;
         let slot_mapping = Tensor::<Cuda, Int>::new(slot_mapping, &self.dev)?;
 
-        let context = Context {
-            phase: Phase::Prefill,
-            cu_seqlens_q: Some(cu_seqlens_q),
-            cu_seqlens_k: Some(cu_seqlens_k),
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_mapping,
-            context_lens: None,
-            block_tables,
+        let context = AttnContext { 
+            block_tables, 
+            slot_mapping, 
+            state: AttnState::Prefill(PrefillState {
+                cu_seqlens_k, cu_seqlens_q, max_seqlen_k, max_seqlen_q
+            })
         };
 
         Ok((input_ids, positions, context))
     }
 
-    pub fn build_decode(&mut self, seqs: &[Sequence]) -> anyhow::Result<(IntTensor<Cuda>, IntTensor<Cuda>, Context)> {
+    pub fn build_decode(&mut self, seqs: &[Sequence]) -> anyhow::Result<(IntTensor<Cuda>, IntTensor<Cuda>, AttnContext)> {
         let mut input_ids: Vec<i32> = vec![];
         let mut positions: Vec<i32> = vec![];
         let mut slot_mapping: Vec<i32> = vec![];
@@ -166,15 +160,12 @@ impl ModelRunner {
         let context_lens = Tensor::<Cuda, Int>::new(context_lens, &self.dev)?;
         let block_tables = self.prepare_block_tables(seqs)?;
 
-        let context = Context {
-            phase: Phase::Decode,
-            cu_seqlens_q: None,
-            cu_seqlens_k: None,
-            max_seqlen_q: 0,
-            max_seqlen_k: 0,
-            slot_mapping,
-            context_lens: Some(context_lens),
-            block_tables: Some(block_tables),
+        let context = AttnContext { 
+            block_tables, 
+            slot_mapping, 
+            state: AttnState::Decode(DecodeState {
+                context_lens
+            })
         };
 
         Ok((input_ids, positions, context))

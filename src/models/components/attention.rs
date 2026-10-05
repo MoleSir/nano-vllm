@@ -1,23 +1,45 @@
-use anyhow::Context as _;
+use luma::tensor::IntTensor;
 use luma::{Cuda, Float, Tensor};
 use luma_flash_attn::{flash_attn_varlen_func, flash_attn_with_kvcache};
-
-use crate::engine::Phase;
 use crate::kernels;
-use crate::models::Context;
 
-/// Paged attention component, mirroring `nanovllm/layers/attention.py`.
-///
-/// It owns the per-layer K/V cache views into the runner's big paged cache and
-/// runs the two flash-attention entry points from `luma-flash-attn`:
-/// `flash_attn_varlen_func` for prefill and `flash_attn_with_kvcache` for
-/// decode.
+pub struct PrefillState {
+    /// `(num_seqs + 1,)` — cumulative query lengths (prefill).
+    pub cu_seqlens_q: IntTensor<Cuda>,
+    /// `(num_seqs + 1,)` — cumulative key lengths (prefill).
+    pub cu_seqlens_k: IntTensor<Cuda>,
+
+    pub max_seqlen_q: usize,
+    pub max_seqlen_k: usize,
+}
+
+pub struct DecodeState {
+    /// `(num_seqs,)` — total KV length per sequence (used by decode reads).
+    pub context_lens: IntTensor<Cuda>,
+}
+
+pub enum AttnState {
+    Prefill(PrefillState),
+    Decode(DecodeState),
+}
+
+pub struct AttnContext {
+    /// `(num_seqs, max_blocks)` — logical block -> physical block page table.
+    /// Present during prefill only when a cached prefix exists.
+    pub block_tables: IntTensor<Cuda>,
+
+    /// `(total_tokens,)` — physical slot for each newly computed token, used by
+    /// the `store_kvcache` write kernel.
+    pub slot_mapping: IntTensor<Cuda>,
+
+    pub state: AttnState,
+}
+
 pub struct Attention {
     pub num_heads: usize,
     pub head_dim: usize,
     pub num_kv_heads: usize,
     pub scale: f64,
-
     /// `(num_blocks, block_size, num_kv_heads, head_dim)` view.
     pub k_cache: Tensor<Cuda, Float>,
     pub v_cache: Tensor<Cuda, Float>,
@@ -41,7 +63,7 @@ impl Attention {
         q: &Tensor<Cuda, Float>,
         k: &Tensor<Cuda, Float>,
         v: &Tensor<Cuda, Float>,
-        ctx: &Context,
+        ctx: &AttnContext,
     ) -> anyhow::Result<Tensor<Cuda, Float>> {
         let num_tokens = q.dims()[0];
         let q = q.reshape((num_tokens, self.num_heads, self.head_dim))?;
@@ -57,32 +79,27 @@ impl Attention {
         kernels::store_kvcache(&k, &v, &self.k_cache, &self.v_cache, &ctx.slot_mapping)?;
 
         let scale = Some(self.scale);
-        let block_tables = ctx.block_tables.as_ref().context("attention missing block_tables")?;
+        let block_tables = &ctx.block_tables;
 
         // 最后都输出 (num_tokens, num_q_heads, head_size)。
-        let out = match ctx.phase {
-            // Prefill：变长打包，统一从分页 cache 读取（新 K/V 已写入）。
-            Phase::Prefill => {
-                let cu_seqlens_q = ctx.cu_seqlens_q.as_ref().context("prefill missing cu_seqlens_q")?;
-                let cu_seqlens_k = ctx.cu_seqlens_k.as_ref().context("prefill missing cu_seqlens_k")?;
+        let out = match &ctx.state {
+            AttnState::Prefill(state) => {
                 flash_attn_varlen_func(
                     &q,
                     &self.k_cache,
                     &self.v_cache,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
+                    &state.cu_seqlens_q,
+                    &state.cu_seqlens_k,
+                    state.max_seqlen_q,
+                    state.max_seqlen_k,
                     scale,
                     true,
                     Some(block_tables),
                 )?
             }
-            // Decode：每序列一个 token。
-            Phase::Decode => {
-                let context_lens = ctx.context_lens.as_ref().context("decode missing context_lens")?;
+            AttnState::Decode(state) => {
                 let q = q.reshape((num_tokens, 1, self.num_heads, self.head_dim))?;
-                flash_attn_with_kvcache(&q, &self.k_cache, &self.v_cache, context_lens, block_tables, scale)?
+                flash_attn_with_kvcache(&q, &self.k_cache, &self.v_cache, &state.context_lens, block_tables, scale)?
             }
         };
 
