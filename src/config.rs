@@ -1,4 +1,5 @@
 use derive_builder::Builder;
+use luma::FloatDType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -28,6 +29,13 @@ pub struct Config {
 
     #[builder(default = 0)]
     pub num_kvcache_blocks: usize,
+
+    /// Model / KV-cache compute dtype. Not read from JSON; set explicitly via
+    /// the builder (defaults to F32). The checkpoint dtype must be loadable into
+    /// it (loading casts if they differ).
+    #[builder(default = "FloatDType::F32")]
+    #[serde(skip)]
+    pub dtype: FloatDType,
 }
 
 impl Default for Config {

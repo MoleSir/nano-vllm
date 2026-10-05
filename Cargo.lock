@@ -272,6 +272,7 @@ version = "0.19.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562"
 dependencies = [
+ "half",
  "libloading",
 ]
 
@@ -752,6 +753,8 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "num-traits",
+ "rand 0.9.5",
+ "rand_distr",
  "zerocopy",
 ]
 
@@ -1106,7 +1109,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "luma-compile"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "luma-cpu",
  "luma-cuda",
@@ -1119,10 +1122,11 @@ dependencies = [
 
 [[package]]
 name = "luma-cpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "gemm",
+ "half",
  "libm",
  "luma-tensor",
  "num_cpus",
@@ -1133,11 +1137,12 @@ dependencies = [
 
 [[package]]
 name = "luma-cuda"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bindgen_cuda",
  "bytemuck",
  "cudarc",
+ "half",
  "luma-tensor",
  "rand 0.9.5",
  "rand_distr",
@@ -1146,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "luma-dataset"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "flate2",
@@ -1161,15 +1166,18 @@ dependencies = [
 
 [[package]]
 name = "luma-flash-attn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cudarc",
+ "half",
+ "luma-cuda",
+ "luma-tensor",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "luma-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "luma-tensor",
  "memmap2",
@@ -1180,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "luma-kit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "luma-compile",
  "luma-cpu",
@@ -1194,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "luma-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1204,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "luma-nn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "luma-cuda",
  "luma-flash-attn",
@@ -1217,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "luma-optim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "luma-io",
  "luma-tensor",
@@ -1227,9 +1235,10 @@ dependencies = [
 
 [[package]]
 name = "luma-tensor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
+ "half",
  "num_cpus",
  "paste",
  "rand 0.9.5",
@@ -1353,6 +1362,7 @@ dependencies = [
  "bytemuck",
  "cudarc",
  "derive_builder",
+ "luma-flash-attn",
  "luma-kit",
  "minijinja",
  "rand 0.10.3",

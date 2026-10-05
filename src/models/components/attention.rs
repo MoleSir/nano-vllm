@@ -1,12 +1,17 @@
+use anyhow::Context as _;
 use luma::{Cuda, Float, Tensor};
+use luma_flash_attn::{flash_attn_varlen_func, flash_attn_with_kvcache};
+
 use crate::engine::Phase;
-use crate::models::Context;
 use crate::kernels;
+use crate::models::Context;
 
 /// Paged attention component, mirroring `nanovllm/layers/attention.py`.
 ///
-/// It owns the per-layer K/V cache views into the runner's big paged cache.
-/// Kernels are not implemented yet (see [`crate::kernels`]).
+/// It owns the per-layer K/V cache views into the runner's big paged cache and
+/// runs the two flash-attention entry points from `luma-flash-attn`:
+/// `flash_attn_varlen_func` for prefill and `flash_attn_with_kvcache` for
+/// decode.
 pub struct Attention {
     pub num_heads: usize,
     pub head_dim: usize,
@@ -42,27 +47,45 @@ impl Attention {
         let q = q.reshape((num_tokens, self.num_heads, self.head_dim))?;
         let k = k.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
-        
+
         /*
             - k/v: (num_tokens, num_kv_heads, head_size)
             - k/v_cache: (num_block, block_size, num_kv_heads, head_size)
             - slot_mapping: (num_tokens,)
-            k/v 是刚计算出来的值，需要填充到 k/v_cache 里面。slot_mapping[i] 是 k/v[i] 在 k/v_cache 的位置
+            k/v 是刚计算出来的值，需要填充到 k/v_cache 里面。slot_mapping[i] 是 k/v[i] 在 k/v_cache 的位置。
         */
         kernels::store_kvcache(&k, &v, &self.k_cache, &self.v_cache, &ctx.slot_mapping)?;
 
-        // 最后都输出：(num_tokens, num_q_heads, head_size) -> (num_tokens, num_q_heads, head_size) 都 q 的 shape 一致
-        match ctx.phase {
-            // 完成了 prefill 阶段，并且根据 block_tables 判断是否有前缀缓存
-            Phase::Prefill => if ctx.block_tables.is_some() {
-                // 有前缀缓存，直接传入 kv cache，
-                kernels::flash_attn_varlen(&q, &self.k_cache, &self.v_cache, ctx, self.scale)
-            } else {
-                // 没有前缀缓存，不需要用到 kv cache
-                kernels::flash_attn_varlen(&q, &k, &v, ctx, self.scale)
+        let scale = Some(self.scale);
+        let block_tables = ctx.block_tables.as_ref().context("attention missing block_tables")?;
+
+        // 最后都输出 (num_tokens, num_q_heads, head_size)。
+        let out = match ctx.phase {
+            // Prefill：变长打包，统一从分页 cache 读取（新 K/V 已写入）。
+            Phase::Prefill => {
+                let cu_seqlens_q = ctx.cu_seqlens_q.as_ref().context("prefill missing cu_seqlens_q")?;
+                let cu_seqlens_k = ctx.cu_seqlens_k.as_ref().context("prefill missing cu_seqlens_k")?;
+                flash_attn_varlen_func(
+                    &q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    scale,
+                    true,
+                    Some(block_tables),
+                )?
             }
-            // Decode 阶段
-            Phase::Decode => kernels::flash_attn_with_kvcache(&q, &self.k_cache, &self.v_cache, ctx, self.scale),
-        }
+            // Decode：每序列一个 token。
+            Phase::Decode => {
+                let context_lens = ctx.context_lens.as_ref().context("decode missing context_lens")?;
+                let q = q.reshape((num_tokens, 1, self.num_heads, self.head_dim))?;
+                flash_attn_with_kvcache(&q, &self.k_cache, &self.v_cache, context_lens, block_tables, scale)?
+            }
+        };
+
+        Ok(out.reshape((num_tokens, self.num_heads * self.head_dim))?)
     }
 }

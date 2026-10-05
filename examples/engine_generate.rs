@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Context;
+use luma::dtype::FloatDType;
 use nanovllm::config::Config;
 use nanovllm::engine::LLMEngine;
 use nanovllm::models::SamplingParams;
@@ -11,9 +12,17 @@ const MAX_NEW_TOKENS: usize = 48;
 
 fn main() -> anyhow::Result<()> {
     let tokenizer = Tokenizer::from_file(MODEL_DIR).context("load tokenizer")?;
-    let config = Config { model: MODEL_DIR.to_string(), ..Default::default() };
+    // `NANOVLLM_DTYPE=bf16` (or `f16`) switches the model + KV cache dtype.
+    let dtype = match std::env::var("NANOVLLM_DTYPE").as_deref() {
+        Ok("bf16") => FloatDType::BF16,
+        Ok("f16") => FloatDType::F16,
+        _ => FloatDType::F32,
+    };
+    let config = Config { model: MODEL_DIR.to_string(), dtype, ..Default::default() };
     let mut engine = LLMEngine::new(config)?;
-    println!("kv cache blocks: {}", engine.config.num_kvcache_blocks);
+    println!("dtype: {dtype:?}, kv cache blocks: {}", engine.config.num_kvcache_blocks);
+
+    let max_new_tokens = std::env::var("NANOVLLM_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_NEW_TOKENS);
 
     // A >256-token prompt so at least one full KV block is cacheable.
     let long_prompt = "机器学习是人工智能的一个重要分支，它让计算机从数据中自动学习规律。".repeat(24);
@@ -30,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     // ---- round 1: one batch of concurrent requests ----
     println!("\n================ round 1: {} concurrent requests ================", prompts.len());
     for p in &prompts {
-        add(&mut engine, &tokenizer, p, MAX_NEW_TOKENS)?;
+        add(&mut engine, &tokenizer, p, max_new_tokens)?;
     }
     let t0 = Instant::now();
     let outputs = engine.generate()?;
@@ -43,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 
     // ---- round 2: repeat the long prompt -> prefix cache hit (paged prefill) ----
     println!("\n================ round 2: repeated long prompt (prefix cache) ================");
-    add(&mut engine, &tokenizer, &long_prompt, MAX_NEW_TOKENS)?;
+    add(&mut engine, &tokenizer, &long_prompt, max_new_tokens)?;
     let outputs = engine.generate()?;
     for (_id, toks) in &outputs {
         println!("repeat -> {}", tokenizer.decode(toks, true)?);
@@ -58,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         "Tell me a short joke.".to_string(),
     ];
     for p in &mixed {
-        add(&mut engine, &tokenizer, p, MAX_NEW_TOKENS)?;
+        add(&mut engine, &tokenizer, p, max_new_tokens)?;
     }
     let outputs = engine.generate()?;
     for ((_id, toks), p) in outputs.iter().zip(&mixed) {

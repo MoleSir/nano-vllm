@@ -3,6 +3,7 @@ use crate::engine::Phase;
 use crate::models::components::Attention;
 use crate::models::Context as AttnContext;
 use anyhow::Context;
+use std::path::Path;
 use luma::nn::{Buffer, Embedding, EmbeddingConfig, Init, Linear, LinearConfig, Module, RMSNorm, RMSNormConfig};
 use luma::{
     D, Device, Float, Tensor,
@@ -31,6 +32,38 @@ impl<Dev: Device> Qwen2ForCausalLM<Dev> {
             Some(gpt2_linear(config.hidden_size, config.vocab_size, dtype, device).context("init lm_head")?)
         };
         Ok(Self { model, lm_head, config: config.clone() })
+    }
+
+    /// Load a HuggingFace Qwen2 model directory (containing `config.json` and
+    /// `model.safetensors`) into `dtype` on `device`.
+    ///
+    /// The checkpoint is read directly through `luma::io::safetensors`; weights
+    /// whose dtype differs from `dtype` are cast first, because
+    /// `load_state_dict`'s `copy_` does not convert types.
+    pub fn from_pretrained<P: AsRef<Path>>(dir: P, dtype: FloatDType, device: &Dev) -> anyhow::Result<Self> {
+        let dir = dir.as_ref();
+        let config = Qwen2Config::from_file(dir.join("config.json")).context("load Qwen2 config")?;
+        let mut model = Self::new(&config, dtype, device).context("build Qwen2 model")?;
+
+        let path = dir.join("model.safetensors");
+        let content = luma::io::safetensors::load_file(&path, device)
+            .with_context(|| format!("load safetensors {}", path.display()))?;
+
+        let mut state = std::collections::HashMap::with_capacity(content.tensors.len());
+        for (name, tensor) in content.tensors {
+            let tensor = match tensor {
+                luma::DynTensor::Float(f) if f.dtype() != dtype => {
+                    luma::DynTensor::Float(f.cast_float(dtype).with_context(|| format!("cast `{name}` to {dtype:?}"))?)
+                }
+                other => other,
+            };
+            state.insert(name, tensor);
+        }
+
+        // strict = false: the rope buffers are generated, not stored, and
+        // checkpoints may carry extra tensors (e.g. an untied `lm_head.weight`).
+        model.load_state_dict(&state, false).context("apply Qwen2 state dict")?;
+        Ok(model)
     }
 
     pub fn forward(

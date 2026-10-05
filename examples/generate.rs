@@ -1,5 +1,5 @@
 use anyhow::Context;
-use luma::dtype::IntDType;
+use luma::dtype::{FloatDType, IntDType};
 use luma::tensor::IntTensor;
 use luma::{Device, Tensor, no_grad};
 use nanovllm::models::SamplingParams;
@@ -26,7 +26,12 @@ fn run<Dev: Device>(device: &Dev) -> anyhow::Result<()> {
     no_grad!();
 
     let tokenizer = Tokenizer::from_file(MODEL_DIR).context("load tokenizer")?;
-    let model = Qwen2ForCausalLM::<Dev>::from_pretrained(MODEL_DIR, device).context("load model")?;
+    let dtype = match std::env::var("NANOVLLM_DTYPE").as_deref() {
+        Ok("bf16") => FloatDType::BF16,
+        Ok("f16") => FloatDType::F16,
+        _ => FloatDType::F32,
+    };
+    let model = Qwen2ForCausalLM::<Dev>::from_pretrained(MODEL_DIR, dtype, device).context("load model")?;
     println!("model loaded: {} layers, hidden {}", model.config.num_hidden_layers, model.config.hidden_size);
 
     let messages = vec![Message::user("你好，请用一句话介绍一下你自己。")];

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use luma::{Cuda, FloatDType, IndexOp, Int, Tensor, tensor::IntTensor};
+use luma::{Cuda, DType, IndexOp, Int, Tensor, tensor::IntTensor};
 
 use crate::{
     config::Config,
@@ -25,8 +25,8 @@ impl ModelRunner {
     pub fn new(config: Config, dev: Cuda) -> anyhow::Result<Self> {
         let model_dir = Path::new(&config.model);
         let model_config = Qwen2Config::from_file(model_dir.join("config.json"))?;
-        let model = Qwen2ForCausalLM::<Cuda>::from_pretrained(model_dir, &dev)?;
-        let kv_cache = Tensor::zeros((0,), (&dev, FloatDType::F32))?;
+        let model = Qwen2ForCausalLM::<Cuda>::from_pretrained(model_dir, config.dtype, &dev)?;
+        let kv_cache = Tensor::zeros((0,), (&dev, config.dtype))?;
 
         let mut runner = Self {
             config,
@@ -72,8 +72,6 @@ impl ModelRunner {
         let mut max_seqlen_q = 0usize;
         let mut max_seqlen_k = 0usize;
         let mut slot_mapping: Vec<i32> = vec![];
-        let mut context_lens = None;
-        let mut block_tables = None;
 
         // 对每个 seq
         for seq in seqs {
@@ -123,20 +121,8 @@ impl ModelRunner {
         assert_eq!(input_ids.len(), *cu_seqlens_q.last().unwrap() as usize);
         assert_eq!(input_ids.len(), slot_mapping.len());
 
-        // 如果这个 seq 有前缀缓存
-        if cu_seqlens_k.last().unwrap() > cu_seqlens_q.last().unwrap() {
-            // 记录每个 seq 的长度
-            /*
-                为什么有前缀和，需要每个 seqs 的长度？怎么感觉和 cu_seqlens_k 重复啊？
-                seq_lens[i] = seqlen_k[i+1] - seqlen_k[i]?
-
-                为什么需要 block_table，因为如果没有前缀和，全部 kv 都需要计算，所以利用 input_ids 就可以得到所有 q k v 
-                感觉和 slot_mapping 也有点重叠？
-            */
-            let seq_lens: Vec<i32> = seqs.iter().map(|s| s.len() as i32).collect();
-            context_lens = Some(Tensor::<Cuda, Int>::new(seq_lens, &self.dev)?);
-            block_tables = Some(self.prepare_block_tables(seqs)?);
-        }
+        // Attention 统一从分页 cache 读取（新 K/V 已写入），因此 prefill 也始终需要 block table。
+        let block_tables = Some(self.prepare_block_tables(seqs)?);
 
         let input_ids = Tensor::<Cuda, Int>::new(input_ids, &self.dev)?;
         let positions = Tensor::<Cuda, Int>::new(positions, &self.dev)?;
@@ -151,7 +137,7 @@ impl ModelRunner {
             max_seqlen_q,
             max_seqlen_k,
             slot_mapping,
-            context_lens,
+            context_lens: None,
             block_tables,
         };
 
@@ -203,12 +189,14 @@ impl ModelRunner {
         let available = budget.saturating_sub(used);
 
         let head_size = self.model_config.head_size();
+        let dtype: DType = self.config.dtype.into();
+        let elem_bytes = dtype.size_in_bytes();
         let block_bytes = 2
             * self.model_config.num_hidden_layers
             * BLOCK_SIZE
             * self.model_config.num_key_value_heads
             * head_size
-            * std::mem::size_of::<f32>();
+            * elem_bytes;
         self.config.num_kvcache_blocks = available / block_bytes.max(1);
 
         let shape = (
@@ -219,7 +207,7 @@ impl ModelRunner {
             self.model_config.num_key_value_heads,
             head_size,
         );
-        self.kv_cache = Tensor::zeros(shape, (&self.dev, FloatDType::F32))?;
+        self.kv_cache = Tensor::zeros(shape, (&self.dev, self.config.dtype))?;
 
         let scale = 1.0 / (head_size as f64).sqrt();
         self.attn.clear();

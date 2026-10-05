@@ -54,11 +54,10 @@ fn cuda_arch_flags() -> Vec<String> {
 }
 
 fn main() {
-    let sources = ["src/kernels/store_kvcache.cu", "src/kernels/flash_attn.cu", "src/kernels/paged_attn.cu"];
+    let sources = ["src/kernels/store_kvcache.cu"];
     for src in sources {
         println!("cargo:rerun-if-changed={src}");
     }
-    println!("cargo:rerun-if-changed=src/kernels/paged_attn_common.cuh");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
