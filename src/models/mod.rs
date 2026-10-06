@@ -1,5 +1,6 @@
 pub mod components;
 pub mod qwen2;
+pub mod qwen3;
 
 mod sample;
 pub use sample::*;
@@ -42,6 +43,7 @@ pub fn load_model(dir: &Path, dtype: FloatDType, device: &Cuda) -> anyhow::Resul
 
     match model_type {
         "qwen2" => Ok(Box::new(qwen2::Qwen2ForCausalLM::<Cuda>::from_pretrained(dir, dtype, device)?)),
+        "qwen3" => Ok(Box::new(qwen3::Qwen3ForCausalLM::<Cuda>::from_pretrained(dir, dtype, device)?)),
         other => anyhow::bail!("unsupported model_type `{other}` in {}", config_path.display()),
     }
 }

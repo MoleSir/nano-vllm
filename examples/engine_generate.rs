@@ -11,7 +11,9 @@ const MODEL_DIR: &str = "./cache/Qwen2.5-0.5B-Instruct";
 const MAX_NEW_TOKENS: usize = 48;
 
 fn main() -> anyhow::Result<()> {
-    let tokenizer = Tokenizer::from_pretrained(MODEL_DIR).context("load tokenizer")?;
+    // `NANOVLLM_MODEL` overrides the model directory (e.g. ./cache/Qwen3-0.6B).
+    let model_dir = std::env::var("NANOVLLM_MODEL").unwrap_or_else(|_| MODEL_DIR.to_string());
+    let tokenizer = Tokenizer::from_pretrained(&model_dir).context("load tokenizer")?;
     // `NANOVLLM_DTYPE=bf16` (or `f16`) switches the model + KV cache dtype.
     let dtype = match std::env::var("NANOVLLM_DTYPE").as_deref() {
         Ok("bf16") => FloatDType::BF16,
@@ -19,7 +21,7 @@ fn main() -> anyhow::Result<()> {
         _ => FloatDType::F32,
     };
     let config = Config { dtype, ..Default::default() };
-    let mut engine = LLMEngine::new(MODEL_DIR, config)?;
+    let mut engine = LLMEngine::new(&model_dir, config)?;
     println!("dtype: {dtype:?}, kv cache blocks: {}", engine.model_runner.num_kvcache_blocks);
 
     let max_new_tokens = std::env::var("NANOVLLM_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_NEW_TOKENS);
