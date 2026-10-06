@@ -43,6 +43,23 @@ impl Tokenizer {
         env.add_function("raise_exception", |message: String| -> Result<minijinja::Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, message))
         });
+        // HF 模板（Qwen3 等）会调用 Python 风格的 `str.startswith` / `str.endswith`，
+        // minijinja 没有内置这些字符串方法，这里补上。
+        env.set_unknown_method_callback(|_state, value, method, args| {
+            let Some(s) = value.as_str() else {
+                return Err(Error::new(ErrorKind::UnknownMethod, format!("unknown method `{method}`")));
+            };
+            let string_arg = |name: &str| -> Result<&str, Error> {
+                args.first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, format!("`{name}` expects a string argument")))
+            };
+            match method {
+                "startswith" => Ok(minijinja::Value::from(s.starts_with(string_arg(method)?))),
+                "endswith" => Ok(minijinja::Value::from(s.ends_with(string_arg(method)?))),
+                _ => Err(Error::new(ErrorKind::UnknownMethod, format!("unknown method `{method}`"))),
+            }
+        });
 
         let context = serde_json::json!({
             "messages": messages,
