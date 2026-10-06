@@ -2,10 +2,10 @@ use std::time::Instant;
 
 use anyhow::Context;
 use luma::dtype::FloatDType;
-use nanovllm::config::Config;
-use nanovllm::engine::LLMEngine;
-use nanovllm::models::SamplingParams;
-use nanovllm::tokenizer::{EncodeOptions, Message, Tokenizer};
+use nano_vllm::config::Config;
+use nano_vllm::engine::LLMEngine;
+use nano_vllm::models::SamplingParams;
+use nano_vllm::tokenizer::{EncodeOptions, Message, Tokenizer};
 
 const MODEL_DIR: &str = "./cache/Qwen2.5-0.5B-Instruct";
 const MAX_NEW_TOKENS: usize = 48;

@@ -22,9 +22,9 @@ NANOVLLM_MODEL=./cache/Qwen3-0.6B NANOVLLM_DTYPE=bf16 cargo run --release --exam
 
 ```rust
 use luma::dtype::FloatDType;
-use nanovllm::config::Config;
-use nanovllm::engine::LLMEngine;
-use nanovllm::models::SamplingParams;
+use nano_vllm::config::Config;
+use nano_vllm::engine::LLMEngine;
+use nano_vllm::models::SamplingParams;
 
 let config = Config { dtype: FloatDType::BF16, ..Default::default() };
 let mut engine = LLMEngine::new("./cache/Qwen2.5-0.5B-Instruct", config)?;
