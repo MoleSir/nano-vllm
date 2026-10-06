@@ -1,40 +1,27 @@
-use std::path::Path;
-use luma::{Cuda, DType, IndexOp, Int, Tensor, tensor::IntTensor};
+use luma::{Cuda, DType, Int, Tensor, tensor::IntTensor};
+
 use crate::{
     config::Config,
     engine::{BLOCK_SIZE, Phase, Sequence},
     models::{
-        components::{Attention, AttnContext, AttnState, DecodeState, PrefillState},
-        qwen2::{Qwen2Config, Qwen2ForCausalLM},
+        ForCausalLM,
+        components::{AttnContext, AttnState, DecodeState, PrefillState},
     },
 };
 
 pub struct ModelRunner {
-    pub config: Config,
-    pub model_config: Qwen2Config,
-    pub model: Qwen2ForCausalLM<Cuda>,
+    pub model: Box<dyn ForCausalLM>,
     pub kv_cache: Tensor<Cuda>,
-    pub attn: Vec<Attention>,
+    /// 由显存预算和模型维度算出的 KV cache 块数（`Scheduler` 据此建 BlockManager）。
+    pub num_kvcache_blocks: usize,
     pub dev: Cuda,
 }
 
 impl ModelRunner {
-    pub fn new(config: Config, dev: Cuda) -> anyhow::Result<Self> {
-        let model_dir = Path::new(&config.model);
-        let model_config = Qwen2Config::from_file(model_dir.join("config.json"))?;
-        let model = Qwen2ForCausalLM::<Cuda>::from_pretrained(model_dir, config.dtype, &dev)?;
-        let kv_cache = Tensor::zeros((0,), (&dev, config.dtype))?;
-
-        let mut runner = Self {
-            config,
-            model_config,
-            model,
-            kv_cache,
-            attn: Vec::new(),
-            dev,
-        };
-        runner.allocate_kv_cache()?;
-        Ok(runner)
+    pub fn new(config: &Config, mut model: Box<dyn ForCausalLM>) -> anyhow::Result<Self> {
+        let dev = model.device().clone();
+        let (kv_cache, num_kvcache_blocks) = Self::allocate_kv_cache(config, &dev, model.as_mut())?;
+        Ok(Self { model, kv_cache, num_kvcache_blocks, dev })
     }
 
     /// 对一个批次做一次 forward，并返回每序列采样出的一个 token。
@@ -47,7 +34,7 @@ impl ModelRunner {
 
         // input_ids/positions: (num_tokens,) -> (num_seq, vocab_size)
         // 此时 kvcache 中已经被插入了新计算出来的 token，但 seq.len() 还不变
-        let logits = self.model.forward_paged(&input_ids, &positions, &context, &self.attn)?;
+        let logits = self.model.forward(&input_ids, &positions, &context)?;
 
         // (num_seq, vocab_size)：逐个 seq 用各自的采样参数采一个 token
         let vocab = *logits.dims().last().expect("logits must be non-empty");
@@ -127,12 +114,10 @@ impl ModelRunner {
         let cu_seqlens_k = Tensor::<Cuda, Int>::new(cu_seqlens_k, &self.dev)?;
         let slot_mapping = Tensor::<Cuda, Int>::new(slot_mapping, &self.dev)?;
 
-        let context = AttnContext { 
-            block_tables, 
-            slot_mapping, 
-            state: AttnState::Prefill(PrefillState {
-                cu_seqlens_k, cu_seqlens_q, max_seqlen_k, max_seqlen_q
-            })
+        let context = AttnContext {
+            block_tables,
+            slot_mapping,
+            state: AttnState::Prefill(PrefillState { cu_seqlens_k, cu_seqlens_q, max_seqlen_k, max_seqlen_q }),
         };
 
         Ok((input_ids, positions, context))
@@ -160,62 +145,37 @@ impl ModelRunner {
         let context_lens = Tensor::<Cuda, Int>::new(context_lens, &self.dev)?;
         let block_tables = self.prepare_block_tables(seqs)?;
 
-        let context = AttnContext { 
-            block_tables, 
-            slot_mapping, 
-            state: AttnState::Decode(DecodeState {
-                context_lens
-            })
+        let context = AttnContext {
+            block_tables,
+            slot_mapping,
+            state: AttnState::Decode(DecodeState { context_lens }),
         };
 
         Ok((input_ids, positions, context))
     }
 
-    /// Allocate the single paged KV cache tensor and build the per-layer
-    /// Shape: `(2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)`.
-    pub fn allocate_kv_cache(&mut self) -> anyhow::Result<()> {
-        let (free, total) = self.dev.mem_get_info();
+    /// Allocate the single paged KV cache tensor and hand each layer's view to
+    /// the model.
+    ///
+    /// Shape: `(2, num_layers, num_blocks, block_size, num_kv_heads, head_size)`.
+    fn allocate_kv_cache(config: &Config, dev: &Cuda, model: &mut dyn ForCausalLM) -> anyhow::Result<(Tensor<Cuda>, usize)> {
+        let num_hidden_layers = model.num_hidden_layers();
+        let num_key_value_heads = model.num_key_value_heads();
+        let head_size = model.head_size();
+
+        let (free, total) = dev.mem_get_info();
         let used = total.saturating_sub(free);
-        let budget = (total as f64 * self.config.gpu_memory_utilization) as usize;
+        let budget = (total as f64 * config.gpu_memory_utilization) as usize;
         let available = budget.saturating_sub(used);
 
-        let head_size = self.model_config.head_size();
-        let dtype: DType = self.config.dtype.into();
-        let elem_bytes = dtype.size_in_bytes();
-        let block_bytes = 2
-            * self.model_config.num_hidden_layers
-            * BLOCK_SIZE
-            * self.model_config.num_key_value_heads
-            * head_size
-            * elem_bytes;
-        self.config.num_kvcache_blocks = available / block_bytes.max(1);
+        let dtype: DType = config.dtype.into();
+        let block_bytes = 2 * num_hidden_layers * BLOCK_SIZE * num_key_value_heads * head_size * dtype.size_in_bytes();
+        let num_kvcache_blocks = available / block_bytes.max(1);
 
-        let shape = (
-            2,
-            self.model_config.num_hidden_layers,
-            self.config.num_kvcache_blocks,
-            BLOCK_SIZE,
-            self.model_config.num_key_value_heads,
-            head_size,
-        );
-        self.kv_cache = Tensor::zeros(shape, (&self.dev, self.config.dtype))?;
-
-        let scale = 1.0 / (head_size as f64).sqrt();
-        self.attn.clear();
-        for i in 0..self.model_config.num_hidden_layers {
-            let k_cache = self.kv_cache.i((0usize, i))?;
-            let v_cache = self.kv_cache.i((1usize, i))?;
-            self.attn.push(Attention::new(
-                self.model_config.num_attention_heads,
-                head_size,
-                self.model_config.num_key_value_heads,
-                scale,
-                k_cache,
-                v_cache,
-            ));
-        }
-
-        Ok(())
+        let shape = (2, num_hidden_layers, num_kvcache_blocks, BLOCK_SIZE, num_key_value_heads, head_size);
+        let kv_cache = Tensor::<Cuda>::zeros(shape, (dev, config.dtype))?;
+        model.register_kvcache(&kv_cache)?;
+        Ok((kv_cache, num_kvcache_blocks))
     }
 
     /// 将输入 seqs 的 block table 整理为 2 维的 Tensor（num_seq, max_len），max_len 是所有 seq 中 block 最大的

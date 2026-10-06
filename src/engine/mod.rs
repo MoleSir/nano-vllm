@@ -7,10 +7,12 @@ pub use runner::*;
 pub use scheduler::*;
 pub use sequence::*;
 
+use std::path::Path;
+
 use luma::Cuda;
 use crate::{
     config::Config,
-    models::SamplingParams,
+    models::{SamplingParams, load_model},
     tokenizer::{EncodeOptions, Tokenizer},
 };
 
@@ -36,16 +38,15 @@ pub struct LLMEngine {
 }
 
 impl LLMEngine {
-    pub fn new(mut config: Config) -> anyhow::Result<Self> {
-        let tokenizer = Tokenizer::from_file(&config.model)?;
-        config.eos_token_id = tokenizer.eos_token_id();
+    pub fn new(model_dir: impl AsRef<Path>, config: Config) -> anyhow::Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let tokenizer = Tokenizer::from_pretrained(model_dir)?;
 
         let dev = Cuda::new(0)?;
-        let model_runner = ModelRunner::new(config.clone(), dev)?;
-        // `allocate_kv_cache` fills in the number of blocks on the runner's
-        // config; propagate it so the scheduler's block manager is sized correctly.
-        config.num_kvcache_blocks = model_runner.config.num_kvcache_blocks;
-        let scheduler = Scheduler::new(&config);
+        let model = load_model(model_dir, config.dtype, &dev)?;
+        let model_runner = ModelRunner::new(&config, model)?;
+        // runner 根据显存/模型维度算出块数；scheduler 据此建 BlockManager。
+        let scheduler = Scheduler::new(&config, tokenizer.eos_token_id(), model_runner.num_kvcache_blocks);
 
         Ok(Self { config, tokenizer, model_runner, scheduler })
     }

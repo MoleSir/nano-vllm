@@ -1,3 +1,4 @@
+use anyhow::Context;
 use luma::tensor::IntTensor;
 use luma::{Cuda, Float, Tensor};
 use luma_flash_attn::{flash_attn_varlen_func, flash_attn_with_kvcache};
@@ -35,14 +36,15 @@ pub struct AttnContext {
     pub state: AttnState,
 }
 
+#[derive(Clone)]
 pub struct Attention {
     pub num_heads: usize,
     pub head_dim: usize,
     pub num_kv_heads: usize,
     pub scale: f64,
     /// `(num_blocks, block_size, num_kv_heads, head_dim)` view.
-    pub k_cache: Tensor<Cuda, Float>,
-    pub v_cache: Tensor<Cuda, Float>,
+    pub k_cache: Option<Tensor<Cuda, Float>>,
+    pub v_cache: Option<Tensor<Cuda, Float>>,
 }
 
 impl Attention {
@@ -51,10 +53,8 @@ impl Attention {
         head_dim: usize,
         num_kv_heads: usize,
         scale: f64,
-        k_cache: Tensor<Cuda, Float>,
-        v_cache: Tensor<Cuda, Float>,
     ) -> Self {
-        Self { num_heads, head_dim, num_kv_heads, scale, k_cache, v_cache }
+        Self { num_heads, head_dim, num_kv_heads, scale, k_cache: None, v_cache: None }
     }
 
     /// `q/k/v` arrive with shape `(num_tokens, heads * head_dim)`.
@@ -70,13 +70,16 @@ impl Attention {
         let k = k.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
 
+        let k_cache = self.k_cache.as_ref().context("k cache not register")?;
+        let v_cache = self.v_cache.as_ref().context("k cache not register")?;
+
         /*
             - k/v: (num_tokens, num_kv_heads, head_size)
             - k/v_cache: (num_block, block_size, num_kv_heads, head_size)
             - slot_mapping: (num_tokens,)
             k/v 是刚计算出来的值，需要填充到 k/v_cache 里面。slot_mapping[i] 是 k/v[i] 在 k/v_cache 的位置。
         */
-        kernels::store_kvcache(&k, &v, &self.k_cache, &self.v_cache, &ctx.slot_mapping)?;
+        kernels::store_kvcache(&k, &v, k_cache, v_cache, &ctx.slot_mapping)?;
 
         let scale = Some(self.scale);
         let block_tables = &ctx.block_tables;
@@ -86,8 +89,8 @@ impl Attention {
             AttnState::Prefill(state) => {
                 flash_attn_varlen_func(
                     &q,
-                    &self.k_cache,
-                    &self.v_cache,
+                    k_cache,
+                    v_cache,
                     &state.cu_seqlens_q,
                     &state.cu_seqlens_k,
                     state.max_seqlen_q,
@@ -99,7 +102,7 @@ impl Attention {
             }
             AttnState::Decode(state) => {
                 let q = q.reshape((num_tokens, 1, self.num_heads, self.head_dim))?;
-                flash_attn_with_kvcache(&q, &self.k_cache, &self.v_cache, &state.context_lens, block_tables, scale)?
+                flash_attn_with_kvcache(&q, k_cache, v_cache, &state.context_lens, block_tables, scale)?
             }
         };
 

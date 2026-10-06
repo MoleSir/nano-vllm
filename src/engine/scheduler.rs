@@ -25,12 +25,12 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, eos_token_id: u32, num_kvcache_blocks: usize) -> Self {
         Self {
             max_num_seqs: config.max_num_seqs,
             max_batched_tokens: config.max_batched_tokens,
-            eos_token_id: config.eos_token_id,
-            block_manager: BlockManager::new(config.num_kvcache_blocks),
+            eos_token_id,
+            block_manager: BlockManager::new(num_kvcache_blocks),
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             num_finished: 0,

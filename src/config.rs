@@ -1,45 +1,28 @@
-use derive_builder::Builder;
 use luma::FloatDType;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
-#[builder(pattern = "owned")]
-#[serde(default)]
+/// 引擎的**用户输入**配置。
+///
+/// 只包含调用方可调的外部参数。运行时派生值不放这里：
+/// `eos_token_id` 由 `Scheduler` 持有，`num_kvcache_blocks` 由 `ModelRunner`
+/// 根据显存和模型维度算出并持有。
+#[derive(Debug, Clone)]
 pub struct Config {
-    #[builder(default = "String::new()")]
-    pub model: String,
-
-    #[builder(default = 32768)]
     pub max_batched_tokens: usize,
-
-    #[builder(default = 512)]
     pub max_num_seqs: usize,
-
-    #[builder(default = 4096)]
-    pub max_model_len: usize,
-
-    #[builder(default = 0.9)]
     pub gpu_memory_utilization: f64,
 
-    #[builder(default = false)]
-    pub enforce_eager: bool,
-
-    #[builder(default = 0)]
-    pub eos_token_id: u32,
-
-    #[builder(default = 0)]
-    pub num_kvcache_blocks: usize,
-
-    /// Model / KV-cache compute dtype. Not read from JSON; set explicitly via
-    /// the builder (defaults to F32). The checkpoint dtype must be loadable into
-    /// it (loading casts if they differ).
-    #[builder(default = "FloatDType::F32")]
-    #[serde(skip)]
+    /// 模型 / KV cache 的计算 dtype。`load_model` 从这里取。
+    /// checkpoint 与目标 dtype 不一致时加载会自动 cast。
     pub dtype: FloatDType,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        ConfigBuilder::default().build().expect("Qwen2Config defaults are valid")
+        Self {
+            max_batched_tokens: 32768,
+            max_num_seqs: 512,
+            gpu_memory_utilization: 0.9,
+            dtype: FloatDType::F32,
+        }
     }
 }

@@ -60,7 +60,7 @@ pub struct AddedToken {
 }
 
 impl Tokenizer {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+    pub fn from_pretrained<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
 
         let tokenizer_path = path.join("tokenizer.json");
@@ -128,13 +128,13 @@ mod tests {
 
     #[test]
     fn test_load_file() {
-        let tokenizer = Tokenizer::from_file("./assets/tokenizer").unwrap();
+        let tokenizer = Tokenizer::from_pretrained("./assets/tokenizer").unwrap();
         assert_eq!(tokenizer.bos_token_id(), 1);
     }
 
     #[test]
     fn test_chat_template() {
-        let tokenizer = Tokenizer::from_file("./assets/tokenizer").unwrap();
+        let tokenizer = Tokenizer::from_pretrained("./assets/tokenizer").unwrap();
         let messages = vec![
             Message::system("You are a helpful and concise AI assistant.", []),
             Message::user("Hello, who are you?"),
